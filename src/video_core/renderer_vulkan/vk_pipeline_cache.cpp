@@ -650,6 +650,8 @@ std::unordered_map<u64, u8> LoadUsedPipelines(const std::filesystem::path& path,
 // memory built before the game started; the list is only saved at exit or after two minutes, so a
 // boot that ran out of memory never saved one and the next boot did the same.
 constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+// Cached graphics pipelines built at boot whatever the list says (~0.45 MB of driver memory each).
+constexpr size_t MinPipelinesAlwaysBuilt = 2000;
 
 // EDEN_NX2_PRELOAD_ALL_PIPELINES=1 builds every cached pipeline at boot, as before.
 bool PreloadAllPipelines() {
@@ -860,7 +862,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
-        if (!PreloadAllPipelines() &&
+        // A cache this small is built whole at boot: a pipeline left for later is built on the
+        // GPU thread mid-game (6-30 ms each, Ocarina of Time built ~200 of them that way in two
+        // minutes of a session, stuttering each time a place was entered again).
+        if (!PreloadAllPipelines() && queued_graphics >= MinPipelinesAlwaysBuilt &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
@@ -880,6 +885,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             std::scoped_lock lock{state.mutex};
             if (pipeline) {
                 graphics_cache.emplace(key, std::move(pipeline));
+            } else if (static u32 failed{}; failed++ < 16) {
+                LOG_INFO(Render_Vulkan, "Cached graphics pipeline {:016x} failed to build at boot",
+                         key.Hash());
             }
             ++state.built;
             if (state.has_loaded) {
@@ -1429,7 +1437,18 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
                     max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    // A compute shader that uses warp operations is built with requiredSubgroupSize = 32 (see
+    // ComputePipeline), so on a GPU whose subgroups can be wider (AMD wave64) its subgroup is
+    // still exactly one guest warp. Emitting the wide-warp emulation there only costs time: every
+    // shuffle, vote and ballot turns into extra index math, and some into chains of broadcasts.
+    Shader::Profile compute_profile{profile};
+    if (profile.warp_size_potentially_larger_than_guest &&
+        device.IsExtSubgroupSizeControlSupported() &&
+        device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
+        device.GetMinSubgroupSize() <= GuestWarpSize) {
+        compute_profile.warp_size_potentially_larger_than_guest = false;
+    }
+    const std::vector<u32> code{EmitSPIRV(compute_profile, program)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

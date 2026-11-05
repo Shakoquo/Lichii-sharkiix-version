@@ -241,6 +241,13 @@ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
     return read_highest - read_lowest + INST_SIZE;
 }
 
+const char* GenericEnvironment::DebugWhyNotSerializable() const noexcept {
+    if (has_unbound_instructions) {
+        return "read instructions outside its cached code";
+    }
+    return "has a native trap prefix";
+}
+
 bool GenericEnvironment::CanBeSerialized() const noexcept {
     return !has_unbound_instructions && (!lowered_native || lowered_native->trap_prefix.empty());
 }
@@ -1194,6 +1201,14 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
             .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
     }
     if (!std::ranges::all_of(envs, &GenericEnvironment::CanBeSerialized)) {
+        if (static std::atomic<u32> logged{}; logged.fetch_add(1) < 32) {
+            for (const GenericEnvironment* const env : envs) {
+                if (!env->CanBeSerialized()) {
+                    LOG_INFO(Render_Vulkan, "Pipeline not stored on disk: a stage {}",
+                             env->DebugWhyNotSerializable());
+                }
+            }
+        }
         return;
     }
     const u32 num_envs{static_cast<u32>(envs.size())};

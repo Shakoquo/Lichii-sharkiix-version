@@ -4,8 +4,15 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <vector>
 #include <atomic>
 #include <cstdlib>
+#include <unordered_map>
+#include <mutex>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -62,6 +69,97 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// Semaphore releases sent to the back whose payload may not be in guest memory yet (the back
+// writes it once the host GPU gets there), by device address. Everything goes to the host in
+// one ordered stream, so an acquire that such a release satisfies needs no wait: the release
+// runs before the commands after the acquire. Front thread only.
+std::unordered_map<u64, u32>& QueuedReleases() {
+    static std::unordered_map<u64, u32> releases;
+    return releases;
+}
+
+void NoteQueuedRelease(std::optional<DAddr> device, u32 payload) {
+    if (device && VideoCommon::GpuSplit::Get().Active()) {
+        QueuedReleases()[*device] = payload;
+    }
+}
+
+// EDEN_NX2_ACQUIRE_STATS=1: how each semaphore acquire ends, by address, every 2 s:
+// queued release, already in memory, after a drain, after the fences, suspended.
+struct AcquireStatEntry {
+    std::array<u32, 5> counts{};
+    u32 target{};
+    u32 current{};
+    u64 suspended_ns{};
+    u64 max_suspended_ns{};
+    u32 resumed{};
+    u32 latched{};
+    u32 channel_mask{};
+    u32 source_mask{};
+    u32 operation{};
+    u32 queued{};
+    u32 back{};
+};
+
+bool AcquireStatsEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr;
+    return enabled;
+}
+
+std::unordered_map<u64, AcquireStatEntry>& AcquireStatEntries() {
+    static std::unordered_map<u64, AcquireStatEntry> entries;
+    return entries;
+}
+
+void AcquireResumeStat(std::optional<DAddr> device, u64 ns, bool latched, s32 channel, u32 source) {
+    if (!AcquireStatsEnabled()) {
+        return;
+    }
+    AcquireStatEntry& entry = AcquireStatEntries()[device.value_or(0)];
+    entry.suspended_ns += ns;
+    entry.max_suspended_ns = (std::max)(entry.max_suspended_ns, ns);
+    ++entry.resumed;
+    entry.latched += latched ? 1 : 0;
+    entry.channel_mask |= 1U << (static_cast<u32>(channel) & 31);
+    entry.source_mask |= 1U << (source & 31);
+}
+
+void AcquireStat(std::optional<DAddr> device, u32 outcome, u32 target, u32 current) {
+    if (!AcquireStatsEnabled()) {
+        return;
+    }
+    using Entry = AcquireStatEntry;
+    auto& entries = AcquireStatEntries();
+    static auto since = std::chrono::steady_clock::now();
+    Entry& entry = entries[device.value_or(0)];
+    ++entry.counts[outcome];
+    entry.target = target;
+    entry.current = current;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds{2}) {
+        return;
+    }
+    since = now;
+    std::vector<std::pair<u32, u64>> order;
+    for (const auto& [address, e] : entries) {
+        order.emplace_back(e.counts[2] + e.counts[3] + e.counts[4], address);
+    }
+    std::sort(order.rbegin(), order.rend());
+    LOG_INFO(HW_GPU, "nx2 acquire stats over 2 s ({} addresses): queued/memory/drain/fences/suspended",
+             entries.size());
+    for (size_t i = 0; i < (std::min<size_t>)(order.size(), 8); ++i) {
+        const Entry& e = entries[order[i].second];
+        LOG_INFO(HW_GPU, "  {:#x}: {}/{}/{}/{}/{} (last target {:#x}, memory {:#x}); suspended "
+                 "{:.1f} ms in all, avg {:.3f} ms, max {:.2f} ms over {} resumes ({} by GPU write, channels {:#x}, sources {:#x}) op {} queued {:#x} back {:#x}",
+                 order[i].second, e.counts[0], e.counts[1], e.counts[2], e.counts[3], e.counts[4],
+                 e.target, e.current, static_cast<double>(e.suspended_ns) / 1e6,
+                 e.resumed ? static_cast<double>(e.suspended_ns) / 1e6 / e.resumed : 0.0,
+                 static_cast<double>(e.max_suspended_ns) / 1e6, e.resumed, e.latched,
+                 e.channel_mask, e.source_mask, e.operation, e.queued, e.back);
+    }
+    entries.clear();
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -70,7 +168,73 @@ void ReleaseFences(DmaPusher& dma_pusher) {
         VideoCommon::DrainSite::FenceRelease);
 }
 
+// Before suspending a channel on an acquire: put the pending releases behind a fence and go
+// on without waiting for the host GPU to reach it. The fencing thread runs them when it does
+// and the suspended channel resumes from the scheduler's polling. Waiting here (ReleaseFences)
+// drained the host GPU at every acquire: ~130 a second in Ocarina of Time, 17% of the GPU
+// thread asleep and the GPU idle after each one. EDEN_NX2_SYNC_ACQUIRE=1 waits as before.
+void ReleaseFencesForAcquire(DmaPusher& dma_pusher) {
+    static const bool sync = [] {
+        const char* value = std::getenv("EDEN_NX2_SYNC_ACQUIRE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (sync) {
+        ReleaseFences(dma_pusher);
+        return;
+    }
+    VideoCommon::GpuSplit::Get().Run(
+        [rasterizer = dma_pusher.rasterizer] { rasterizer->SignalReference(); },
+        VideoCommon::DrainSite::FenceRelease);
+}
+
 } // Anonymous namespace
+
+void Nx2NoteQueuedRelease(DAddr device, u32 payload) {
+    NoteQueuedRelease(device, payload);
+}
+
+// Releases the back has put behind a host fence (compute QMD releases), any thread.
+std::mutex& BackReleaseMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::unordered_map<u64, u32>& BackReleases() {
+    static std::unordered_map<u64, u32> releases;
+    return releases;
+}
+bool Nx2BackReleasesEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_RESUME_BACK");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+void Nx2NoteBackAdd(DAddr device, u32 payload, u32 memory_value) {
+    // Opt-in (EDEN_NX2_RESUME_ADD=1): OoT Kokiri forest entrance 20-21 fps -> 28-29, but the
+    // game flickers (something reads the compute output before the host GPU wrote it).
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_RESUME_ADD");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!enabled || !Nx2BackReleasesEnabled()) {
+        return;
+    }
+    // Adds queued in order: the value after this one is the last queued value (or memory when
+    // none is pending) plus the payload.
+    std::scoped_lock lk{BackReleaseMutex()};
+    auto& releases = BackReleases();
+    const auto it = releases.find(device);
+    const u32 base = it != releases.end() ? it->second : memory_value;
+    releases[device] = base + payload;
+}
+
+void Nx2NoteBackRelease(DAddr device, u32 payload) {
+    if (!Nx2BackReleasesEnabled()) {
+        return;
+    }
+    std::scoped_lock lk{BackReleaseMutex()};
+    BackReleases()[device] = payload;
+}
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
@@ -105,6 +269,32 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire->Matches(current)) {
         return true;
     }
+    // Another channel queued the release since: the host runs it before what follows (one
+    // ordered stream), as the acquire's own fast path assumes.
+    static const bool resume_queued = [] {
+        const char* v = std::getenv("EDEN_NX2_RESUME_QUEUED");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (resume_queued) {
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address)) {
+            auto& queued = QueuedReleases();
+            if (const auto it = queued.find(*device);
+                it != queued.end() && pending_acquire->Matches(it->second)) {
+                return true;
+            }
+            if (Nx2BackReleasesEnabled()) {
+                std::scoped_lock lk{BackReleaseMutex()};
+                auto& back = BackReleases();
+                if (const auto it = back.find(*device); it != back.end()) {
+                    if (it->second == current) {
+                        back.erase(it);
+                    } else if (pending_acquire->Matches(it->second)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
         pending_acquire->reported = true;
@@ -130,6 +320,16 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (AcquireStatsEnabled()) {
+            const u32 source = Nx2SemaphoreWaiters::Get().LatchSource(this);
+            const bool latched = Nx2SemaphoreWaiters::Get().Latched(this);
+            AcquireResumeStat(dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address),
+                              static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() -
+                                                   pending_acquire->since)
+                                                   .count()),
+                              latched, dma_pusher.channel_state.bind_id, source);
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -238,6 +438,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        NoteQueuedRelease(dma_pusher.memory_manager.GpuToCpuAddress(sequence_address), payload);
+        // A front macro's DMA read of these bytes must wait for it.
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
+            VideoCommon::GpuSplit::Get().NoteMemoryWriterRange(*device, 16);
+        } else {
+            VideoCommon::GpuSplit::Get().NoteMemoryWriter();
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -255,8 +462,33 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        // Most acquires wait on a value the CPU (or work the back thread already ran) has
+        // written: met in guest memory now, the channel goes on, and the back thread keeps the
+        // order of everything queued. Draining first made the front wait for the back thread at
+        // every such acquire (a third of the front thread's time in OoT's fields).
+        static const bool drain_always = std::getenv("EDEN_NX2_ACQUIRE_DRAIN") != nullptr;
+        const auto acquire_device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        const u32 first_read = dma_pusher.memory_manager.Read<u32>(acquire.address);
+        if (!drain_always) {
+            auto& queued = QueuedReleases();
+            if (acquire_device) {
+                if (const auto it = queued.find(*acquire_device); it != queued.end()) {
+                    if (first_read == it->second) {
+                        queued.erase(it); // landed: guest memory tells from now on
+                    } else if (acquire.Matches(it->second)) {
+                        AcquireStat(acquire_device, 0, acquire.value, first_read);
+                        return;
+                    }
+                }
+            }
+            if (acquire.Matches(first_read)) {
+                AcquireStat(acquire_device, 1, acquire.value, first_read);
+                return;
+            }
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            AcquireStat(acquire_device, 2, acquire.value, first_read);
             return;
         }
         // Registered before the fences run, so a release among them that meets the value counts
@@ -265,13 +497,24 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        ReleaseFences(dma_pusher);
+        ReleaseFencesForAcquire(dma_pusher);
         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+            AcquireStat(acquire_device, 4, acquire.value, first_read);
+            if (AcquireStatsEnabled() && acquire_device) {
+                AcquireStatEntry& e = AcquireStatEntries()[*acquire_device];
+                e.operation = acquire.operation;
+                const auto qit = QueuedReleases().find(*acquire_device);
+                e.queued = qit != QueuedReleases().end() ? qit->second : 0xffffffffU;
+                std::scoped_lock lk{BackReleaseMutex()};
+                const auto bit = BackReleases().find(*acquire_device);
+                e.back = bit != BackReleases().end() ? bit->second : 0xffffffffU;
+            }
         } else {
             waiters.Remove(this);
+            AcquireStat(acquire_device, 3, acquire.value, first_read);
         }
     } else {
         DrainBack();
@@ -312,6 +555,9 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
+        Nx2NoteBackRelease(*device, payload);
+    }
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -341,6 +587,12 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        NoteQueuedRelease(dma_pusher.memory_manager.GpuToCpuAddress(address), payload);
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+            VideoCommon::GpuSplit::Get().NoteMemoryWriterRange(*device, 16);
+        } else {
+            VideoCommon::GpuSplit::Get().NoteMemoryWriter();
+        }
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.

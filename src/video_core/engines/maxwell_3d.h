@@ -3205,6 +3205,9 @@ public:
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
+    /// Methods whose execution writes guest memory (reports, inline uploads): a front macro's DMA
+    /// read waits for them (GpuSplit::NoteWriter) instead of draining the back.
+    static bool IsMemoryWriterMethod(u32 method);
     void FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -3390,6 +3393,7 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void NoteFrontMemoryWriter(VideoCommon::GpuSplit& split, FrontState& fs, u32 method);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

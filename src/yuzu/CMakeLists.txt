@@ -171,6 +171,7 @@ add_executable(yuzu
     loading_screen.ui
 
     main.cpp
+    ../yuzu_cmd/nx2_sampler.cpp
 
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h

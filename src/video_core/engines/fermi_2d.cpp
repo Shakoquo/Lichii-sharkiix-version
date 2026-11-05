@@ -155,7 +155,26 @@ void Fermi2D::Blit() {
     }
 
     memory_manager.FlushCaching();
-    if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+    const bool accelerated = rasterizer->AccelerateSurfaceCopy(src, regs.dst, config);
+    if (static const u64 trace_destination = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+            return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        trace_destination != 0 && regs.dst.Address() == trace_destination) {
+        static u32 traced{};
+        if (traced++ < 16) {
+            LOG_INFO(HW_GPU,
+                     "nx2 2D blit detail: accelerated={} src_format={:#x} dst_format={:#x} "
+                     "filter={} must_accelerate={} src=({},{})-({},{}) dst=({},{})-({},{}) "
+                     "src_linear={} dst_linear={}",
+                     accelerated, static_cast<u32>(src.format), static_cast<u32>(regs.dst.format),
+                     static_cast<u32>(config.filter), config.must_accelerate, config.src_x0,
+                     config.src_y0, config.src_x1, config.src_y1, config.dst_x0, config.dst_y0,
+                     config.dst_x1, config.dst_y1, static_cast<u32>(src.linear),
+                     static_cast<u32>(regs.dst.linear));
+        }
+    }
+    if (!accelerated) {
         sw_blitter->Blit(src, regs.dst, config);
     }
 }

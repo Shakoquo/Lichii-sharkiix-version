@@ -427,16 +427,34 @@ Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value) 
     return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_add_global_func_u32, ctx.Def(address), value);
 }
 
-Id EmitGlobalAtomicSMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value) {
+    if (!ctx.profile.support_int64) {
+        throw NotImplementedException("Global atomic addressing requires 64-bit integers");
+    }
+    if (!Sirit::ValidId(ctx.atomic_smin_global_func_u32)) {
+        throw NotImplementedException("Global atomic min with no routable storage buffer");
+    }
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_smin_global_func_u32, ctx.Def(address), value);
 }
 
-Id EmitGlobalAtomicUMin32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value) {
+    if (!ctx.profile.support_int64) {
+        throw NotImplementedException("Global atomic addressing requires 64-bit integers");
+    }
+    if (!Sirit::ValidId(ctx.atomic_umin_global_func_u32)) {
+        throw NotImplementedException("Global atomic min with no routable storage buffer");
+    }
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_umin_global_func_u32, ctx.Def(address), value);
 }
 
-Id EmitGlobalAtomicSMax32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value) {
+    if (!ctx.profile.support_int64) {
+        throw NotImplementedException("Global atomic addressing requires 64-bit integers");
+    }
+    if (!Sirit::ValidId(ctx.atomic_smax_global_func_u32)) {
+        throw NotImplementedException("Global atomic max with no routable storage buffer");
+    }
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_smax_global_func_u32, ctx.Def(address), value);
 }
 
 Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value) {

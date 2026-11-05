@@ -147,6 +147,10 @@ if (MSVC AND NOT CXX_CLANG)
     set(CMAKE_EXE_LINKER_FLAGS_DEBUG   "/DEBUG /MANIFEST:NO" CACHE STRING "" FORCE)
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "/DEBUG /MANIFEST:NO /INCREMENTAL:NO /OPT:REF,ICF" CACHE STRING "" FORCE)
 else()
+    if (WIN32)
+        # clang-cl and MinGW also see windows.h's min/max macros
+        add_compile_definitions(NOMINMAX)
+    endif()
     if (NOT MSVC)
         add_compile_options(
             $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>

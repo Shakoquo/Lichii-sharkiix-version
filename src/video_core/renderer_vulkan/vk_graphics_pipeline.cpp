@@ -683,6 +683,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.UpdateRenderTargets(false);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         texture_cache.CheckFeedbackLoop(view_span);
+        if (static const bool keep_views = std::getenv("EDEN_NX2_FRAME_DUMP_INPUTS_PS") != nullptr;
+            keep_views) {
+            dump_views.clear();
+            for (const auto& view : views) {
+                dump_views.push_back(view.id);
+            }
+        }
         if (scheduler.TakeFragmentBarrier() &&
             (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
             scheduler.RequestOutsideRenderPassOperationContext();
@@ -1051,7 +1058,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .depthTestEnable = dynamic.depth_test_enable,
         .depthWriteEnable = dynamic.depth_write_enable,
         .depthCompareOp = dynamic.depth_test_enable
-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              ? MaxwellToVK::DepthTestOp(dynamic.DepthTestFunc())
                               : VK_COMPARE_OP_ALWAYS,
         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
         .stencilTestEnable = dynamic.stencil_enable,

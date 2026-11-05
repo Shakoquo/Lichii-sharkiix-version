@@ -459,11 +459,20 @@ void DmaPusher::CallMethod(u32 argument) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
+        // Also what writes guest memory a front macro's DMA read may see (FrontDmaRead):
+        // inline uploads, 2D copies and the 3D engine's reports and uploads.
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool memory_writer = engine_type == Engines::EngineTypes::KeplerMemory ||
+                                   engine_type == Engines::EngineTypes::Fermi2D ||
+                                   (engine_type == Engines::EngineTypes::Maxwell3D &&
+                                    Engines::Maxwell3D::IsMemoryWriterMethod(dma_state.method));
+        bool front_notes_writer = false;
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (memory_writer && !front_notes_writer) {
+                split.NoteMemoryWriter();
             }
         };
         if (split.Active()) {
@@ -473,6 +482,8 @@ void DmaPusher::CallMethod(u32 argument) {
                 if (type == Engines::EngineTypes::Maxwell3D) {
                     auto* const maxwell3d = static_cast<Engines::Maxwell3D*>(subchannel);
                     if (maxwell3d->GetNativeMacroEngine().native_turing) {
+                        // FrontWrite notes the writer with its range (NoteFrontMemoryWriter).
+                        front_notes_writer = true;
                         maxwell3d->FrontCallMethod(system, split, dma_state.method, argument,
                                                    dma_state.is_last_call);
                         return;
@@ -518,11 +529,19 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
+        // Also what writes guest memory a front macro's DMA read may see (FrontDmaRead):
+        // inline uploads, 2D copies and the 3D engine's reports and uploads.
         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
                             engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool memory_writer = engine_type == Engines::EngineTypes::KeplerMemory ||
+                                   engine_type == Engines::EngineTypes::Fermi2D ||
+                                   (engine_type == Engines::EngineTypes::Maxwell3D &&
+                                    Engines::Maxwell3D::IsMemoryWriterMethod(dma_state.method));
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+            } else if (memory_writer) {
+                split.NoteMemoryWriter();
             }
         };
         if (split.Active()) {

@@ -165,6 +165,33 @@ public:
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
+    /// Other guest-memory writes (3D reports and inline uploads, semaphore releases) a front
+    /// macro's DMA read may see. Kept apart from NoteWriter: every GP entry waits for those.
+    void NoteMemoryWriter() {
+        last_memory_writer_position = write_position;
+    }
+    /// A memory writer whose device range is known (a semaphore release, a 3D report, a pitch
+    /// inline upload): a DMA read elsewhere need not wait for it.
+    void NoteMemoryWriterRange(u64 device_start, u64 size) {
+        if (ranged_writer_count != 0) {
+            // Consecutive words of one upload or report: one entry.
+            RangedWriter& last = ranged_writers[ranged_writer_count - 1];
+            if (last.start == device_start && last.end == device_start + size) {
+                last.position = write_position;
+                return;
+            }
+        }
+        if (size == 0 || ranged_writer_count == ranged_writers.size()) {
+            NoteMemoryWriter();
+            return;
+        }
+        ranged_writers[ranged_writer_count++] = {write_position, device_start, device_start + size};
+    }
+    /// Waits until the back executed every writer sent so far (NoteWriter and NoteMemoryWriter).
+    bool WaitForMemoryWriters();
+    /// Same, but ranged writers count only where they overlap the pages read (device addresses
+    /// of the 4 KiB pages, page_count of them).
+    bool WaitForMemoryWriters(const u64* device_pages, size_t page_count);
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -233,6 +260,14 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_memory_writer_position{};
+    struct RangedWriter {
+        u64 position;
+        u64 start;
+        u64 end;
+    };
+    std::array<RangedWriter, 512> ranged_writers{};
+    size_t ranged_writer_count{};
     u64 last_sync_position{};
     u64 published_local{};
     u64 consumed_cache{};

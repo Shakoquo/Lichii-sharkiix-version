@@ -424,9 +424,9 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
 Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
-Id EmitGlobalAtomicSMin32(EmitContext& ctx);
-Id EmitGlobalAtomicUMin32(EmitContext& ctx);
-Id EmitGlobalAtomicSMax32(EmitContext& ctx);
+Id EmitGlobalAtomicSMin32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicUMin32(EmitContext& ctx, const IR::Value& address, Id value);
+Id EmitGlobalAtomicSMax32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicUMax32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicInc32(EmitContext& ctx);
 Id EmitGlobalAtomicDec32(EmitContext& ctx);

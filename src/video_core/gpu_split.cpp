@@ -138,6 +138,8 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_memory_writer_position = 0;
+    ranged_writer_count = 0;
     last_sync_position = 0;
     published_local = 0;
     consumed_cache = 0;
@@ -221,6 +223,38 @@ void GpuSplit::Drain(DrainSite site) {
 
 bool GpuSplit::WaitForWriters() {
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+}
+
+bool GpuSplit::WaitForMemoryWriters() {
+    u64 target = (std::max)(last_writer_position, last_memory_writer_position);
+    for (size_t i = 0; i < ranged_writer_count; ++i) {
+        target = (std::max)(target, ranged_writers[i].position);
+    }
+    ranged_writer_count = 0;
+    return WaitFor(std::min(target, write_position), DrainSite::MacroDmaRead);
+}
+
+bool GpuSplit::WaitForMemoryWriters(const u64* device_pages, size_t page_count) {
+    u64 target = (std::max)(last_writer_position, last_memory_writer_position);
+    // Writers the back has run are done with: drop them, keep the rest.
+    const u64 done = consumed.load(std::memory_order_acquire);
+    size_t kept = 0;
+    for (size_t i = 0; i < ranged_writer_count; ++i) {
+        const RangedWriter& writer = ranged_writers[i];
+        if (writer.position <= done) {
+            continue;
+        }
+        for (size_t page = 0; page < page_count; ++page) {
+            const u64 start = device_pages[page];
+            if (writer.start < start + 0x1000 && start < writer.end) {
+                target = (std::max)(target, writer.position);
+                break;
+            }
+        }
+        ranged_writers[kept++] = writer;
+    }
+    ranged_writer_count = kept;
+    return WaitFor(std::min(target, write_position), DrainSite::MacroDmaRead);
 }
 
 bool GpuSplit::WaitForSync() {

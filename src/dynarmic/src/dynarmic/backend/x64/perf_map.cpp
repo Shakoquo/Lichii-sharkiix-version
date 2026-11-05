@@ -80,3 +80,56 @@ void PerfMapClear() {
 }  // namespace Dynarmic::Backend::X64
 
 #endif
+
+#if defined(_WIN32)
+#    include <cstdio>
+#    include <cstdlib>
+#    include <mutex>
+
+// EDEN_NX2_JIT_MAP=<file>: writes "host_start size a64_<guest pc>_..." for every compiled block,
+// so a profiler can turn a host address in JIT code back into the guest code it runs.
+namespace Dynarmic::Backend::X64 {
+
+namespace {
+std::mutex mutex;
+std::FILE* file = nullptr;
+bool checked = false;
+
+void OpenFile() {
+    checked = true;
+    const char* path = std::getenv("EDEN_NX2_JIT_MAP");
+    if (path == nullptr || path[0] == '\0') {
+        file = nullptr;
+        return;
+    }
+    file = std::fopen(path, "w");
+    if (file != nullptr) {
+        std::setvbuf(file, nullptr, _IONBF, 0);
+    }
+}
+}  // anonymous namespace
+
+namespace detail {
+void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name) {
+    if (start == end) {
+        return;
+    }
+    std::lock_guard guard{mutex};
+    if (!checked) {
+        OpenFile();
+    }
+    if (!file) {
+        return;
+    }
+    const std::string line = fmt::format("{:016x} {:016x} {:s}\n", reinterpret_cast<u64>(start),
+                                         reinterpret_cast<u64>(end) - reinterpret_cast<u64>(start),
+                                         friendly_name);
+    std::fwrite(line.data(), 1, line.size(), file);
+}
+}  // namespace detail
+
+// A cleared code cache reuses its addresses: the profiler keeps the last entry for an address.
+void PerfMapClear() {}
+
+}  // namespace Dynarmic::Backend::X64
+#endif

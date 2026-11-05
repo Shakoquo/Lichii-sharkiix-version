@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/nx2_kick.h"
 
 namespace Tegra {
 
@@ -366,8 +367,19 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
+    /// Which OnWrite source latched owner's waiter (0 when none or unknown).
+    [[nodiscard]] u32 LatchSource(const void* owner) {
+        std::scoped_lock lk{mutex};
+        for (const Waiter& w : waiters) {
+            if (w.owner == owner && w.latched) {
+                return w.source;
+            }
+        }
+        return 0;
+    }
+
     /// A GPU write of `value` to the u32 at `device_address`.
-    void OnWrite(u64 device_address, u32 value) {
+    void OnWrite(u64 device_address, u32 value, u32 source = 0) {
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -375,6 +387,8 @@ public:
         for (auto& w : waiters) {
             if (w.address == device_address && !w.latched && Matches(w, value)) {
                 w.latched = true;
+                w.source = source;
+                VideoCommon::Nx2GpuKick().Set();
             }
         }
     }
@@ -386,6 +400,7 @@ private:
         u32 value;
         u32 operation;
         bool latched;
+        u32 source{};
     };
 
     static bool Matches(const Waiter& w, u32 current) {

@@ -18,6 +18,7 @@
 #include "core/core_timing.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/puller.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
@@ -638,6 +639,11 @@ void Maxwell3D::ProcessQueryGet() {
             flags |= VideoCommon::QueryPropertiesFlags::IsAFence;
         }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
+        if (query_type == VideoCommon::QueryType::Payload) {
+            if (const auto device = memory_manager.GpuToCpuAddress(sequence_address)) {
+                Tegra::Engines::Nx2NoteBackRelease(*device, payload);
+            }
+        }
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
         // TODO(Blinkhawk): Under this operation, the GPU waits for the CPU to write a value that
@@ -646,6 +652,11 @@ void Maxwell3D::ProcessQueryGet() {
         break;
     case Regs::ReportSemaphore::Operation::ReportOnly:
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
+        if (query_type == VideoCommon::QueryType::Payload) {
+            if (const auto device = memory_manager.GpuToCpuAddress(sequence_address)) {
+                Tegra::Engines::Nx2NoteBackRelease(*device, payload);
+            }
+        }
         break;
     case Regs::ReportSemaphore::Operation::Trap:
         UNIMPLEMENTED_MSG("Unimplemented query operation TRAP");
@@ -1014,6 +1025,49 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (IsMemoryWriterMethod(method)) {
+        NoteFrontMemoryWriter(split, fs, method);
+    }
+}
+
+void Maxwell3D::NoteFrontMemoryWriter(VideoCommon::GpuSplit& split, FrontState& fs, u32 method) {
+    // The range a report or a pitch inline upload writes, as device addresses: a macro's DMA
+    // read waits for it only when it reads those pages (WaitForMemoryWriters).
+    GPUVAddr start{};
+    u64 size{};
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        start = (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+                fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        size = 16;
+    } else if ((fs.regs[MAXWELL3D_REG_INDEX(launch_dma)] & 1) != 0) { // pitch layout
+        start = (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(upload.dest.address_high)]} << 32) |
+                fs.regs[MAXWELL3D_REG_INDEX(upload.dest.address_low)];
+        const u64 line = (std::max)(u64{fs.regs[MAXWELL3D_REG_INDEX(upload.line_length_in)]},
+                                    u64{fs.regs[MAXWELL3D_REG_INDEX(upload.dest.pitch)]});
+        size = line * (std::max)(u64{fs.regs[MAXWELL3D_REG_INDEX(upload.line_count)]}, u64{1});
+    }
+    if (size == 0 || size > 0x100000) {
+        split.NoteMemoryWriter();
+        return;
+    }
+    const auto first = memory_manager.GpuToCpuAddress(start);
+    const auto last = memory_manager.GpuToCpuAddress(start + size - 1);
+    if (!first || !last || *last - *first != size - 1) {
+        split.NoteMemoryWriter();
+        return;
+    }
+    split.NoteMemoryWriterRange(*first, size);
+}
+
+bool Maxwell3D::IsMemoryWriterMethod(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(launch_dma):
+    case MAXWELL3D_REG_INDEX(inline_data):
+        return true;
+    default:
+        return false;
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1119,6 +1173,14 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    // The words may run over several methods (an incrementing run): any writer among them.
+    for (const u32 writer : {MAXWELL3D_REG_INDEX(report_semaphore.query),
+                             MAXWELL3D_REG_INDEX(launch_dma), MAXWELL3D_REG_INDEX(inline_data)}) {
+        if (writer >= method && writer < method + (std::max)(amount, 1U)) {
+            split.NoteMemoryWriter(); // registers of a run: not tracked here
+            break;
+        }
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1186,7 +1248,37 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         diag_before.resize(words);
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    // Waiting for the back to run everything queued stalled the front a third of its time in
+    // Ocarina of Time, and only 1 read in ~25000 changed (a report written by a queued write).
+    // Words on pages the GPU never wrote can only change through the writers (NoteWriter):
+    // wait for those. Pages the GPU did write still drain. EDEN_NX2_DMA_READ_DRAIN=1: always.
+    static const bool always_drain = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_DRAIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool gpu_written_source = always_drain;
+    std::array<u64, 8> device_pages{};
+    size_t page_count = 0;
+    for (GPUVAddr page = source & ~GPUVAddr{0xfff}; !gpu_written_source && page < source + read_bytes;
+         page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        gpu_written_source = !device || Tegra::Nx2IsGpuWritten(*device);
+        if (device && page_count < device_pages.size()) {
+            device_pages[page_count++] = *device & ~u64{0xfff};
+        }
+    }
+    // EDEN_NX2_DMA_READ_RANGES=0: wait for every memory writer, as before.
+    static const bool by_range = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_RANGES");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (gpu_written_source) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    } else if (by_range && page_count <= device_pages.size()) {
+        split.WaitForMemoryWriters(device_pages.data(), page_count);
+    } else {
+        split.WaitForMemoryWriters();
+    }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }

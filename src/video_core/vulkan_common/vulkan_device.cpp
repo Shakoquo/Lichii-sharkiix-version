@@ -1584,7 +1584,8 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
 
     // VK_KHR_pipeline_executable_properties
-    if (Settings::values.renderer_shader_feedback.GetValue()) {
+    if (Settings::values.renderer_shader_feedback.GetValue() ||
+        (std::getenv("EDEN_NX2_PIPELINE_STATS") != nullptr)) {
         extensions.pipeline_executable_properties =
             features.pipeline_executable_properties.pipelineExecutableInfo;
         RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_executable_properties,

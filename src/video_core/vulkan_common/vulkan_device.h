@@ -538,6 +538,10 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_properties.supportedStages;
     }
 
+    u32 GetMinSubgroupSize() const {
+        return properties.subgroup_size_control.minSubgroupSize;
+    }
+
     u32 GetMaxSubgroupSize() const {
         return (std::max)(properties.subgroup_properties.subgroupSize,
                           properties.subgroup_size_control.maxSubgroupSize);

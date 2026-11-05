@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -241,15 +242,28 @@ public:
         return IsNativeProgram();
     }
     bool IsCbufStorageBufferPointer(u32 bank, u32 offset) override {
+        if (Assume() && !pointers.contains(CbufKey(bank, offset)))
+            return true;
         return Lookup(pointers, CbufKey(bank, offset), "storage pointer classification") != 0;
     }
+    // SWEEP_ASSUME=1: answer missing context with plain 2D float textures (inspection only).
+    static bool Assume() {
+        static const bool assume = std::getenv("SWEEP_ASSUME") != nullptr;
+        return assume;
+    }
     u32 ReadCbufValue(u32 bank, u32 offset) override {
+        if (Assume() && !cbuf_values.contains(CbufKey(bank, offset)))
+            return offset;
         return Lookup(cbuf_values, CbufKey(bank, offset), "constant buffer value");
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
+        if (Assume() && !texture_types.contains(handle))
+            return Shader::TextureType::Color2D;
         return Lookup(texture_types, handle, "texture type");
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
+        if (Assume() && !texture_formats.contains(handle))
+            return Shader::TexturePixelFormat::R16G16B16A16_FLOAT;
         return Lookup(texture_formats, handle, "texture pixel format");
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
@@ -283,6 +297,8 @@ public:
         return viewport;
     }
     u32 TextureBoundBuffer() const override {
+        if (texture_bound == ~0U && Assume())
+            return 2;
         if (texture_bound == ~0U)
             throw MissingContext("Uncaptured texture-bound constant buffer");
         return texture_bound;
@@ -721,6 +737,7 @@ int main(int argc, char** argv) {
         host.support_conditional_barrier = true;
         host.support_viewport_index_layer = true;
         host.support_geometry_shader_passthrough = true;
+        host.needs_demote_reorder = std::getenv("SWEEP_AMD") != nullptr;
         host.ApplyDescriptorLimitPolicy();
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);

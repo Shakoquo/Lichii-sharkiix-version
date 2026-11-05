@@ -917,18 +917,23 @@ private:
             if (node.type != Type::Block) {
                 continue;
             }
+            // Count epilogues at every depth: a nested early exit is a second return, and moving
+            // the demotes to the end would let pixels taking it skip their demote (Ocarina's
+            // forest fog composite exits early with a zero colour right after its discard ->
+            // black screen on AMD). Only top-level demotes are reordered.
+            for (const IR::Inst& inst : node.data.block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::Epilogue) {
+                    ++num_epilogues;
+                }
+            }
             if (branch_depth > 1) {
                 // Skip reordering nested demote branches.
                 continue;
             }
             for (const IR::Inst& inst : node.data.block->Instructions()) {
-                const IR::Opcode op{inst.GetOpcode()};
-                if (op == IR::Opcode::DemoteToHelperInvocation) {
+                if (inst.GetOpcode() == IR::Opcode::DemoteToHelperInvocation) {
                     demote_blocks.push_back(node.data.block);
                     break;
-                }
-                if (op == IR::Opcode::Epilogue) {
-                    ++num_epilogues;
                 }
             }
         }

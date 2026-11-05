@@ -17,6 +17,7 @@
 #include <vector>
 #include <queue>
 
+#include "video_core/nx2_kick.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -81,7 +82,7 @@ public:
 
     void SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? (Settings::IsGPULevelHigh() || Nx2AccurateSync()) : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
@@ -294,6 +295,7 @@ private:
                     operation();
                 }
             }
+            Nx2GpuKick().Set();
             {
                 std::unique_lock lock(ring_guard);
                 for (Released& released : batch) {

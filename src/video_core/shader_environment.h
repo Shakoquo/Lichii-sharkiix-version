@@ -88,6 +88,7 @@ public:
     }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
+    [[nodiscard]] const char* DebugWhyNotSerializable() const noexcept;
 
     [[nodiscard]] u64 CalculateHash() const;
 

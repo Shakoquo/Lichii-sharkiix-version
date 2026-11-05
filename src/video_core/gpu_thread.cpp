@@ -7,6 +7,7 @@
 #include <chrono>
 #include <thread>
 
+#include "video_core/nx2_kick.h"
 #include "common/assert.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/scope_exit.h"
@@ -79,7 +80,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         std::chrono::microseconds{500}) {
                         std::this_thread::yield();
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        VideoCommon::Nx2GpuKick().WaitFor(std::chrono::microseconds{500});
                     }
                     continue;
                 }
@@ -194,6 +195,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    VideoCommon::Nx2GpuKick().Set();
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {

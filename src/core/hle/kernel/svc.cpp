@@ -14,6 +14,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/nx2_wait_profile.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
 
@@ -2519,6 +2520,47 @@ void Call(Core::System& system, u32 imm) {
         if (colon == nullptr) return std::pair<u64, u64>{0, ~u64{}};
         return std::pair<u64, u64>{std::strtoull(text, nullptr, 10), std::strtoull(colon + 1, nullptr, 10)};
     }();
+    const bool wait_profile = Nx2WaitProfile::Enabled() && imm != 0x80;
+    std::chrono::steady_clock::time_point wait_begin{};
+    u64 wait_lr{}, wait_sp{}, wait_thread{};
+    std::string wait_what;
+    if (wait_profile) {
+        wait_begin = std::chrono::steady_clock::now();
+        Svc::ThreadContext context{};
+        process.GetArmInterface(kernel.CurrentPhysicalCore().CoreIndex())->GetContext(context);
+        wait_lr = context.lr;
+        wait_sp = context.sp;
+        wait_thread = GetCurrentThread(kernel).GetThreadId();
+        // The guest's callers above the SVC wrapper, by its frame-pointer chain.
+        u64 fp = context.fp;
+        for (int depth = 0; depth < 3 && fp != 0 && (fp & 7) == 0 &&
+                            process.GetMemory().IsValidVirtualAddressRange(fp, 16);
+             ++depth) {
+            wait_what += fmt::format("<{:x}", process.GetMemory().Read64(fp + 8));
+            const u64 next = process.GetMemory().Read64(fp);
+            if (next <= fp) {
+                break;
+            }
+            fp = next;
+        }
+        wait_what += ' ';
+        if (imm == 0x18 && static_cast<s32>(GetArg64(args, 2)) > 0) {
+            const u32 handle = process.GetMemory().Read32(GetArg64(args, 1));
+            KScopedAutoObject event =
+                process.GetHandleTable().GetObject<KReadableEvent>(kernel, handle);
+            wait_what += fmt::format("on {:#x}{}", handle,
+                                    event.IsNotNull() ? "=" + Service::KernelHelpers::DebugEventName(
+                                                                  event.GetPointerUnsafe())
+                                                      : std::string{});
+            if (GetArg64(args, 2) > 1) {
+                wait_what += fmt::format(" (+{} more)", GetArg64(args, 2) - 1);
+            }
+        } else if (imm == 0x21) {
+            wait_what += fmt::format("IPC handle {:#x}", static_cast<u32>(GetArg64(args, 0)));
+        } else if (imm == 0x34) {
+            wait_what += fmt::format("address {:#x}", GetArg64(args, 0));
+        }
+    }
     const u64 presents = Core::g_nx2_present_count.load(std::memory_order_relaxed);
     const bool svc_trace = presents >= trace_range.first && presents <= trace_range.second;
     if (svc_trace) {
@@ -2581,6 +2623,9 @@ void Call(Core::System& system, u32 imm) {
     }
     //kernel.ExitSVCProfile();
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
+    if (wait_profile) {
+        Nx2WaitProfile::Record(wait_thread, imm, wait_lr, wait_sp, std::move(wait_what), wait_begin);
+    }
 }
 
 } // namespace Kernel::Svc

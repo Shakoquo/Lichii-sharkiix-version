@@ -4584,7 +4584,7 @@ void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view
                                    std::string_view gpu_vendor) {
     static const std::string build_id = std::string{Common::g_build_id};
     static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
+        fmt::format("{} (sharkiix's version) | {} | {}", std::string{Common::g_build_name},
                     std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
 
     const auto override_title =

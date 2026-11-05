@@ -89,6 +89,9 @@ public:
         const std::array<const Shader::Info*, NUM_STAGES>& infos);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    // Image views of the last configured draw (frame dump input capture only).
+    std::vector<VideoCommon::ImageViewId> dump_views;
+
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }

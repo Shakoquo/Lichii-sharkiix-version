@@ -44,6 +44,11 @@ class RasterizerInterface;
 
 namespace Tegra::Engines {
 
+/// A semaphore release (payload at a device address) the front sent to the back thread.
+void Nx2NoteQueuedRelease(DAddr device, u32 payload);
+void Nx2NoteBackRelease(DAddr device, u32 payload);
+void Nx2NoteBackAdd(DAddr device, u32 payload, u32 memory_value);
+
 class Puller final {
 public:
     struct MethodCall {
