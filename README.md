@@ -1,3 +1,11 @@
+# Lichii (sharkiix's version)
+
+> **VERY EXPERIMENTAL.** Mainly for **AMD** GPUs, optimised for **Zelda: Ocarina of Time** (Switch 2).
+> Unofficial fork of [zortos293/Lichii](https://github.com/zortos293/Lichii): all credit for the emulator goes to zortos293 and the Lichii / Eden / yuzu contributors.
+> What changed and the recommended settings: [SHARKIIX.md](SHARKIIX.md). Download: **Releases** page.
+
+---
+
 <!--
 # SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
