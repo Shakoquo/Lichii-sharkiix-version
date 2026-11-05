@@ -14,7 +14,7 @@ All credit for the emulator itself goes to the Lichii / Eden / yuzu authors. Thi
 ## Recommended settings for Ocarina of Time
 Set these environment variables before launching `lichii.exe`:
 - `EDEN_NX2_TC_MIN_AGE=600`
-- `EDEN_NX2_REJECT_HASH=c72b6ea746c00433` (removes the ground-mist shader, which currently renders as a white veil over the whole screen)
+- `EDEN_NX2_REJECT_HASH=c72b6ea746c00433,3ddfb1d7a854c849` (removes the ground mist and the fog/light-shaft composite, which currently render as a white veil over the whole screen)
 - `EDEN_NX2_RESUME_ADD=0`
 
 ## Download
