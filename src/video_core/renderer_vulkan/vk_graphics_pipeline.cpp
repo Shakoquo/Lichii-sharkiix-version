@@ -1,0 +1,1384 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <set>
+#include <span>
+
+#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
+#include <fmt/format.h>
+
+#include "video_core/renderer_vulkan/pipeline_helper.h"
+
+#include "common/bit_field.h"
+#include "common/scope_exit.h"
+#include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_statistics.h"
+#include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/shader_handle_program.h"
+#include "video_core/shader_notify.h"
+#include "video_core/texture_cache/texture_cache.h"
+#include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/renderer_vulkan/pipeline_compile_log.h"
+#include "common/settings.h"
+#include "shader_recompiler/exception.h"
+#include "video_core/nx2_profile.h"
+
+#if defined(__clang__) && defined(NDEBUG)
+#define LAMBDA_FORCEINLINE __attribute__((always_inline))
+#elif defined(_MSC_VER) && defined(NDEBUG)
+#define LAMBDA_FORCEINLINE [[msvc::forceinline]]
+#else
+#define LAMBDA_FORCEINLINE
+#endif
+
+namespace Vulkan {
+namespace {
+using boost::container::small_vector;
+using boost::container::static_vector;
+using Shader::ImageBufferDescriptor;
+using Shader::Backend::SPIRV::MESH_DRAW_BASE_OFFSET;
+using Shader::Backend::SPIRV::MeshDrawBaseLayout;
+using Shader::Backend::SPIRV::MeshFirstEnabled;
+using Shader::Backend::SPIRV::RENDERAREA_LAYOUT_OFFSET;
+using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
+using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
+using Tegra::Texture::TexturePair;
+using VideoCore::Surface::PixelFormat;
+using VideoCore::Surface::PixelFormatFromDepthFormat;
+using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
+
+constexpr size_t NUM_STAGES = Maxwell::MaxShaderStage;
+
+// The stage of a program: task and mesh programs sit in the vertex and tessellation slots.
+VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits slot_stage) {
+    if (info.is_task) {
+        return VK_SHADER_STAGE_TASK_BIT_EXT;
+    }
+    if (info.is_mesh) {
+        return VK_SHADER_STAGE_MESH_BIT_EXT;
+    }
+    return slot_stage;
+}
+
+DescriptorLayoutBuilder MakeBuilder(const Device& device, std::span<const Shader::Info> infos) {
+    DescriptorLayoutBuilder builder{device};
+    for (size_t index = 0; index < infos.size(); ++index) {
+        static constexpr std::array stages{
+            VK_SHADER_STAGE_VERTEX_BIT,
+            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+            VK_SHADER_STAGE_GEOMETRY_BIT,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+        builder.Add(infos[index], StageFlag(infos[index], stages.at(index)));
+    }
+    return builder;
+}
+
+template <class StencilFace>
+VkStencilOpState GetStencilFaceState(const StencilFace& face) {
+    return {
+        .failOp = MaxwellToVK::StencilOp(face.ActionStencilFail()),
+        .passOp = MaxwellToVK::StencilOp(face.ActionDepthPass()),
+        .depthFailOp = MaxwellToVK::StencilOp(face.ActionDepthFail()),
+        .compareOp = MaxwellToVK::ComparisonOp(face.TestFunc()),
+        .compareMask = 0,
+        .writeMask = 0,
+        .reference = 0,
+    };
+}
+
+bool SupportsPrimitiveRestart(VkPrimitiveTopology topology) {
+    static constexpr std::array unsupported_topologies{
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
+        VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY,
+        VK_PRIMITIVE_TOPOLOGY_PATCH_LIST,
+        // VK_PRIMITIVE_TOPOLOGY_QUAD_LIST_EXT,
+    };
+    return std::ranges::find(unsupported_topologies, topology) == unsupported_topologies.end();
+}
+
+bool IsLine(VkPrimitiveTopology topology) {
+    static constexpr std::array line_topologies{
+        VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
+        // VK_PRIMITIVE_TOPOLOGY_LINE_LOOP_EXT,
+    };
+    return std::ranges::find(line_topologies, topology) != line_topologies.end();
+}
+
+VkViewportSwizzleNV UnpackViewportSwizzle(u16 swizzle) {
+    union Swizzle {
+        u32 raw;
+        BitField<0, 3, Maxwell::ViewportSwizzle> x;
+        BitField<4, 3, Maxwell::ViewportSwizzle> y;
+        BitField<8, 3, Maxwell::ViewportSwizzle> z;
+        BitField<12, 3, Maxwell::ViewportSwizzle> w;
+    };
+    const Swizzle unpacked{swizzle};
+    return VkViewportSwizzleNV{
+        .x = MaxwellToVK::ViewportSwizzle(unpacked.x),
+        .y = MaxwellToVK::ViewportSwizzle(unpacked.y),
+        .z = MaxwellToVK::ViewportSwizzle(unpacked.z),
+        .w = MaxwellToVK::ViewportSwizzle(unpacked.w),
+    };
+}
+
+PixelFormat DecodeFormat(u8 encoded_format) {
+    const auto format{static_cast<Tegra::RenderTargetFormat>(encoded_format)};
+    if (format == Tegra::RenderTargetFormat::NONE) {
+        return PixelFormat::Invalid;
+    }
+    return PixelFormatFromRenderTargetFormat(format);
+}
+
+RenderPassKey MakeRenderPassKey(const FixedPipelineState& state, const Device& device) {
+    RenderPassKey key{};
+    std::ranges::transform(state.color_formats, key.color_formats.begin(), DecodeFormat);
+    if (state.depth_enabled != 0) {
+        const auto depth_format{static_cast<Tegra::DepthFormat>(state.depth_format.Value())};
+        key.depth_format = PixelFormatFromDepthFormat(depth_format);
+    } else {
+        key.depth_format = PixelFormat::Invalid;
+    }
+    key.samples = MaxwellToVK::MsaaMode(state.msaa_mode);
+    const bool has_color = std::ranges::any_of(key.color_formats, [](PixelFormat format) {
+        return format != PixelFormat::Invalid;
+    });
+    key.resolve_color =
+        key.samples != VK_SAMPLE_COUNT_1_BIT && has_color && device.IsTiler();
+    return key;
+}
+
+size_t NumAttachments(const FixedPipelineState& state) {
+    size_t num{};
+    for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+        const auto format{static_cast<Tegra::RenderTargetFormat>(state.color_formats[index])};
+        if (format != Tegra::RenderTargetFormat::NONE) {
+            num = index + 1;
+        }
+    }
+    return num;
+}
+
+template <typename Spec>
+bool Passes(const std::array<bool, NUM_STAGES>& stages,
+            const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        if (!Spec::enabled_stages[stage] && stages[stage]) {
+            return false;
+        }
+        const auto& info{stage_infos[stage]};
+        if constexpr (!Spec::has_storage_buffers) {
+            if (!info.storage_buffers_descriptors.empty()) {
+                return false;
+            }
+        }
+        if constexpr (!Spec::has_texture_buffers) {
+            if (!info.texture_buffer_descriptors.empty()) {
+                return false;
+            }
+        }
+        if constexpr (!Spec::has_image_buffers) {
+            if (!info.image_buffer_descriptors.empty()) {
+                return false;
+            }
+        }
+        if constexpr (!Spec::has_images) {
+            if (!info.image_descriptors.empty()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
+
+template <typename Spec, typename... Specs>
+ConfigureFuncPtr FindSpec(const std::array<bool, NUM_STAGES>& stages,
+                          const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
+    if constexpr (sizeof...(Specs) > 0) {
+        if (!Passes<Spec>(stages, stage_infos)) {
+            return FindSpec<Specs...>(stages, stage_infos);
+        }
+    }
+    return GraphicsPipeline::MakeConfigureSpecFunc<Spec>();
+}
+
+struct SimpleVertexFragmentSpec {
+    static constexpr std::array<bool, 5> enabled_stages{true, false, false, false, true};
+    static constexpr bool has_storage_buffers = false;
+    static constexpr bool has_texture_buffers = false;
+    static constexpr bool has_image_buffers = false;
+    static constexpr bool has_images = false;
+};
+
+struct SimpleVertexSpec {
+    static constexpr std::array<bool, 5> enabled_stages{true, false, false, false, false};
+    static constexpr bool has_storage_buffers = false;
+    static constexpr bool has_texture_buffers = false;
+    static constexpr bool has_image_buffers = false;
+    static constexpr bool has_images = false;
+};
+
+struct SimpleStorageSpec {
+    static constexpr std::array<bool, 5> enabled_stages{true, false, false, false, true};
+    static constexpr bool has_storage_buffers = true;
+    static constexpr bool has_texture_buffers = false;
+    static constexpr bool has_image_buffers = false;
+    static constexpr bool has_images = false;
+};
+
+struct SimpleImageSpec {
+    static constexpr std::array<bool, 5> enabled_stages{true, false, false, false, true};
+    static constexpr bool has_storage_buffers = false;
+    static constexpr bool has_texture_buffers = false;
+    static constexpr bool has_image_buffers = false;
+    static constexpr bool has_images = true;
+};
+
+struct DefaultSpec {
+    static constexpr std::array<bool, 5> enabled_stages{true, true, true, true, true};
+    static constexpr bool has_storage_buffers = true;
+    static constexpr bool has_texture_buffers = true;
+    static constexpr bool has_image_buffers = true;
+    static constexpr bool has_images = true;
+};
+
+ConfigureFuncPtr ConfigureFunc(const std::array<bool, NUM_STAGES>& stages,
+                               const std::array<Shader::Info, NUM_STAGES>& infos) {
+    return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
+                    DefaultSpec>(stages, infos);
+}
+
+std::atomic<std::chrono::nanoseconds::rep> hold_time_ns{};
+} // Anonymous namespace
+
+std::chrono::nanoseconds GraphicsPipeline::TakeHoldTime() noexcept {
+    return std::chrono::nanoseconds{hold_time_ns.exchange(0, std::memory_order::relaxed)};
+}
+
+// TODO(crueter): This is the worst-formatted code I have EVER seen
+GraphicsPipeline::GraphicsPipeline(
+    Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
+    vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
+    const Device& device_, DescriptorPool& descriptor_pool,
+    GuestDescriptorQueue& guest_descriptor_queue_, DescriptorBufferRing& descriptor_buffer_ring_,
+    Common::ThreadWorker* worker_thread,
+    PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
+    const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages)
+    : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
+      pipeline_cache(pipeline_cache_), scheduler{scheduler_},
+      guest_descriptor_queue{guest_descriptor_queue_},
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      worker_only_build{worker_thread && static_cast<bool>(emit_stages)} {
+    if (shader_notify) {
+        shader_notify->MarkShaderBuilding();
+    }
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        const Shader::Info* const info{infos[stage]};
+        if (!info) {
+            continue;
+        }
+        stage_infos[stage] = *info;
+        enabled_uniform_buffer_masks[stage] = info->constant_buffer_mask;
+        std::ranges::copy(info->constant_buffer_used_sizes, uniform_buffer_sizes[stage].begin());
+        num_image_elements += Shader::NumDescriptors(info->texture_buffer_descriptors);
+        num_image_elements += Shader::NumDescriptors(info->image_buffer_descriptors);
+        num_textures += Shader::NumDescriptors(info->texture_descriptors);
+        num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
+        num_image_elements += Shader::NumDescriptors(info->image_descriptors);
+        num_descriptor_entries += NumDescriptorEntries(*info);
+    }
+    fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
+    const auto any_written = [](const auto& descriptors) {
+        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
+    };
+    writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
+        return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
+               any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
+    });
+
+    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+    uses_push_descriptor = builder.CanUsePushDescriptor();
+    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+    descriptor_set_layout =
+        builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
+    if (uses_descriptor_buffer) {
+        descriptor_buffer_layout = builder.MakeDescriptorBufferLayout(*descriptor_set_layout);
+        if (!descriptor_buffer_ring.CanAllocate(descriptor_buffer_layout.size)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Graphics pipeline {:016X} needs {} descriptor bytes per draw, falling back "
+                        "to sets",
+                        key.Hash(), descriptor_buffer_layout.size);
+            uses_descriptor_buffer = false;
+            descriptor_buffer_layout = {};
+            descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
+        }
+    }
+
+    const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
+    pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    if (!uses_descriptor_buffer) {
+        descriptor_update_template =
+            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
+        if (!uses_push_descriptor) {
+            descriptor_allocator =
+                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+        }
+    }
+
+    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
+                emit_stages = std::move(emit_stages)] {
+        const auto begin = std::chrono::steady_clock::now();
+        SCOPE_EXIT {
+            if (shader_notify) {
+                shader_notify->MarkShaderComplete();
+            }
+        };
+        try {
+            if (emit_stages) {
+                spv_modules = emit_stages();
+            }
+            const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+            Validate();
+            MakePipeline(render_pass);
+        } catch (const Shader::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(), exception.what());
+            throw;
+        } catch (const vk::Exception& exception) {
+            LOG_CRITICAL(Render_Vulkan,
+                         "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
+                         "patch control points {}, device max patch size {})",
+                         exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
+                         spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
+                         device.GetMaxTessellationPatchSize());
+            throw;
+        }
+        if (pipeline_statistics) {
+            pipeline_statistics->Collect(device, *pipeline);
+        }
+        // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
+        // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
+        for (vk::ShaderModule& module : spv_modules) {
+            module.reset();
+        }
+        if (worker_only_build) {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            static std::atomic<u32> logged{};
+            if (elapsed > std::chrono::milliseconds{100} ||
+                (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400)) {
+                LOG_INFO(Render_Vulkan,
+                         "Nx2Perf async_pipelines: {:016x} worker emission and driver build {:.1f} ms",
+                         key.Hash(), std::chrono::duration<double, std::milli>(elapsed).count());
+            }
+        }
+    }};
+    std::array<bool, NUM_STAGES> present_stages{};
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        present_stages[stage] = infos[stage] != nullptr;
+    }
+    configure_func = ConfigureFunc(present_stages, stage_infos);
+    build.emplace(worker_thread, std::move(func));
+}
+
+void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+    transition_keys.push_back(transition->key);
+    transitions.push_back(transition);
+}
+
+template <typename Spec>
+bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+    zero_texture_handles = 0;
+    boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
+    boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
+    views.reserve(num_image_elements);
+    samplers.reserve(num_textures);
+
+    namespace Profile = VideoCommon::Nx2Profile;
+    {
+        Profile::Scope scope{Profile::Zone::SyncDescriptors};
+        texture_cache.SynchronizeDescriptors(false);
+    }
+
+    buffer_cache.SetUniformBuffersState(enabled_uniform_buffer_masks, &uniform_buffer_sizes);
+
+    const auto& regs{maxwell3d->regs};
+    const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
+    const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        const Shader::Info& info{stage_infos[stage]};
+        buffer_cache.UnbindGraphicsStorageBuffers(stage);
+        if constexpr (Spec::has_storage_buffers) {
+            size_t ssbo_index{};
+            for (const auto& desc : info.storage_buffers_descriptors) {
+                ASSERT(desc.count == 1);
+                buffer_cache.BindGraphicsStorageBuffer(
+                    stage, ssbo_index, desc.cbuf_index, desc.cbuf_offset, desc.is_written,
+                    desc.indirect_offset, info.native_global_bounds && !desc.rebased_writes);
+                ++ssbo_index;
+            }
+        }
+        const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
+        const auto read_handle{[&](const auto& desc, u32 index) {
+            if (desc.handle_program != ~0U) {
+                // Read by the shader from a storage buffer: computed for this draw.
+                const auto evaluate{[&](u64 storage_alignment) {
+                    return VideoCommon::EvaluateTextureHandle(
+                        info, desc.handle_program, *gpu_memory,
+                        [&](u32 cbuf) -> GPUVAddr {
+                            return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                              : GPUVAddr{};
+                        },
+                        storage_alignment);
+                }};
+                // The program's storage offsets are relative to the buffer address aligned down
+                // to the host storage alignment (StorageOffset). EDEN_NX2_HANDLE_ALIGN=1 reads
+                // the words there instead of at the unaligned address.
+                static const bool align_storage{std::getenv("EDEN_NX2_HANDLE_ALIGN") != nullptr};
+                const u64 storage_alignment{device.GetStorageBufferAlignment()};
+                const u32 raw{evaluate(align_storage ? storage_alignment : 1)};
+                if (raw == 0) {
+                    ++zero_texture_handles;
+                    static std::set<std::pair<u64, u32>> logged;
+                    const std::pair key_program{key.unique_hashes[stage + 1], desc.handle_program};
+                    if (logged.size() < 64 && logged.insert(key_program).second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Texture handle program {} of stage {} (shader {:016x}) gave 0; "
+                                 "aligned to {} it gives {:#x}, unaligned {:#x}",
+                                 desc.handle_program, stage, key_program.first, storage_alignment,
+                                 evaluate(storage_alignment), evaluate(1));
+                    }
+                }
+                return TexturePair(raw, via_header_index);
+            }
+            ASSERT(cbufs[desc.cbuf_index].enabled);
+            const u32 index_offset{index << desc.size_shift};
+            const u32 offset{desc.cbuf_offset + index_offset};
+            const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
+            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
+                          std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
+                if (desc.has_secondary) {
+                    ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
+                    const u32 second_offset{desc.secondary_cbuf_offset};
+                    const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
+                                                 second_offset};
+                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
+                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
+                                      << desc.secondary_shift_left};
+                    const u32 raw{lhs_raw | rhs_raw};
+                    return TexturePair(raw, via_header_index);
+                }
+            }
+            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
+        }};
+        const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle{read_handle(desc, index)};
+                views.push_back({
+                    .index = handle.first,
+                    .blacklist = blacklist,
+                    .id = {}
+                });
+            }
+        }};
+        if constexpr (Spec::has_texture_buffers) {
+            for (const auto& desc : info.texture_buffer_descriptors) {
+                add_image(desc, false);
+            }
+        }
+        if constexpr (Spec::has_image_buffers) {
+            for (const auto& desc : info.image_buffer_descriptors) {
+                add_image(desc, false);
+            }
+        }
+        for (const auto& desc : info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle{read_handle(desc, index)};
+                views.push_back({handle.first});
+
+                VideoCommon::SamplerId sampler{texture_cache.GetSamplerId(handle.second, false)};
+                samplers.push_back(sampler);
+            }
+        }
+        if constexpr (Spec::has_images) {
+            for (const auto& desc : info.image_descriptors) {
+                add_image(desc, desc.is_written);
+            }
+        }
+
+        return true;
+    }};
+    {
+        Profile::Scope scope{Profile::Zone::ReadHandles};
+        if constexpr (Spec::enabled_stages[0]) {
+            config_stage(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            config_stage(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            config_stage(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            config_stage(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            config_stage(4);
+        }
+    }
+    ASSERT(views.size() == num_image_elements);
+    ASSERT(samplers.size() == num_textures);
+    {
+        Profile::Scope scope{Profile::Zone::FillImageViews};
+        texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
+                                     Spec::has_images);
+    }
+    static const bool record_sampled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRAME_DUMP_SAMPLED");
+        return value && *value != '\0' && *value != '0';
+    }();
+    if (record_sampled) {
+        sampled_images.clear();
+        size_t view_index{};
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                view_index += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            }
+            if constexpr (Spec::has_image_buffers) {
+                view_index += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            const u32 textures = Shader::NumDescriptors(info.texture_descriptors);
+            for (u32 texture = 0; texture < textures; ++texture, ++view_index, ++sampler_index) {
+                sampled_images.push_back({static_cast<u32>(stage), views[view_index].index,
+                                          views[view_index].id, samplers[sampler_index]});
+            }
+            if constexpr (Spec::has_images) {
+                view_index += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+    }
+
+    if constexpr (Spec::has_texture_buffers || Spec::has_image_buffers) {
+        VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
+        const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
+            size_t index{};
+            const auto add_buffer{[&](const auto& desc) {
+                constexpr bool is_image = std::is_same_v<decltype(desc), const ImageBufferDescriptor&>;
+                for (u32 i = 0; i < desc.count; ++i) {
+                    bool is_written{false};
+                    if constexpr (is_image) {
+                        is_written = desc.is_written;
+                    }
+                    ImageView& image_view{texture_cache.GetImageView(texture_buffer_it->id)};
+                    PixelFormat format{image_view.format};
+                    if constexpr (is_image) {
+                        if (const auto explicit_format{PixelFormatFromImageFormat(desc.format)}) {
+                            format = *explicit_format;
+                        }
+                    }
+                    buffer_cache.BindGraphicsTextureBuffer(stage, index, image_view.GpuAddr(),
+                                                           image_view.BufferSize(), format,
+                                                           is_written, is_image);
+                    ++index;
+                    ++texture_buffer_it;
+                }
+            }};
+            buffer_cache.UnbindGraphicsTextureBuffers(stage);
+
+            const Shader::Info& info{stage_infos[stage]};
+            if constexpr (Spec::has_texture_buffers) {
+                for (const auto& desc : info.texture_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            if constexpr (Spec::has_image_buffers) {
+                for (const auto& desc : info.image_buffer_descriptors) {
+                    add_buffer(desc);
+                }
+            }
+            texture_buffer_it += Shader::NumDescriptors(info.texture_descriptors);
+            if constexpr (Spec::has_images) {
+                texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }};
+        Profile::Scope scope{Profile::Zone::TextureBuffers};
+        if constexpr (Spec::enabled_stages[0]) {
+            bind_stage_info(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            bind_stage_info(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            bind_stage_info(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            bind_stage_info(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            bind_stage_info(4);
+        }
+    } else {
+        if constexpr (Spec::enabled_stages[0]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(0);
+        }
+        if constexpr (Spec::enabled_stages[1]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(1);
+        }
+        if constexpr (Spec::enabled_stages[2]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(2);
+        }
+        if constexpr (Spec::enabled_stages[3]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(3);
+        }
+        if constexpr (Spec::enabled_stages[4]) {
+            buffer_cache.UnbindGraphicsTextureBuffers(4);
+        }
+    }
+
+    if (regs.transform_feedback_enabled != 0) {
+        scheduler.RequestOutsideRenderPassOperationContext();
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        buffer_cache.BindHostGeometryBuffers(is_indexed);
+    }
+
+    {
+        Profile::Scope scope{Profile::Zone::DescriptorAcquire};
+        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
+    }
+
+    RescalingPushConstant rescaling;
+    RenderAreaPushConstant render_area;
+    const VideoCommon::SamplerId* samplers_it{samplers.data()};
+    const VideoCommon::ImageViewInOut* views_it{views.data()};
+    const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
+        {
+            Profile::Scope scope{Profile::Zone::BindStageBuffers};
+            buffer_cache.BindHostStageBuffers(stage);
+        }
+        {
+            Profile::Scope scope{Profile::Zone::PushDescriptors};
+            PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
+                                 rescaling, samplers_it, views_it);
+        }
+        const auto& info{stage_infos[stage]};
+        if (info.uses_render_area) {
+            render_area.uses_render_area = true;
+            // Switch 2 titles may never program the surface clip; use colour target 0 then.
+            const u32 clip_width = regs.surface_clip.width, clip_height = regs.surface_clip.height;
+            const bool clip_set = clip_width != 0 && clip_height != 0;
+            render_area.words = {static_cast<float>(clip_set ? clip_width : u32{regs.rt[0].width}),
+                                 static_cast<float>(clip_set ? clip_height : u32{regs.rt[0].height})};
+        }
+    }};
+    if constexpr (Spec::enabled_stages[0]) {
+        prepare_stage(0);
+    }
+    if constexpr (Spec::enabled_stages[1]) {
+        prepare_stage(1);
+    }
+    if constexpr (Spec::enabled_stages[2]) {
+        prepare_stage(2);
+    }
+    if constexpr (Spec::enabled_stages[3]) {
+        prepare_stage(3);
+    }
+    if constexpr (Spec::enabled_stages[4]) {
+        prepare_stage(4);
+    }
+    if (buffer_cache.any_buffer_uploaded) {
+        buffer_cache.runtime.PostCopyBarrier();
+        buffer_cache.any_buffer_uploaded = false;
+    }
+    {
+        Profile::Scope scope{Profile::Zone::RenderTargets};
+        texture_cache.UpdateRenderTargets(false);
+        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
+        texture_cache.CheckFeedbackLoop(view_span);
+        if (scheduler.HasFragmentBarrier() &&
+            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+        }
+    }
+    if (IsBuilt() && (!pipeline || build->Failed())) {
+        return false;
+    }
+    Profile::Scope scope{Profile::Zone::ConfigureDraw};
+    return ConfigureDraw(rescaling, render_area);
+}
+
+bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+                                     const RenderAreaPushConstant& render_area) {
+    if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
+        LOG_CRITICAL(Render_Vulkan, "Graphics descriptor count mismatch: expected {}, got {}",
+                     num_descriptor_entries, guest_descriptor_queue.UpdateCount());
+        return false;
+    }
+    const void* const descriptor_data{guest_descriptor_queue.UpdateData()};
+
+    VkDeviceSize descriptor_buffer_offset{};
+    u32 descriptor_buffer_chunk{};
+    if (descriptor_set_layout && uses_descriptor_buffer) {
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        const bool reuse_allocation =
+            last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
+            last_descriptor_payload.size() == num_descriptor_entries &&
+            std::memcmp(last_descriptor_payload.data(), entries,
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
+        if (reuse_allocation) {
+            descriptor_buffer_offset = last_descriptor_buffer_offset;
+            descriptor_buffer_chunk = last_descriptor_buffer_chunk;
+            descriptor_buffer_ring.TouchFrame(scheduler);
+        } else {
+            const DescriptorBufferRing::Allocation alloc{
+                descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
+            if (!alloc.host) {
+                LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping draw");
+                return false;
+            }
+            WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host);
+            descriptor_buffer_offset = alloc.offset;
+            descriptor_buffer_chunk = alloc.chunk;
+            last_descriptor_buffer_offset = alloc.offset;
+            last_descriptor_buffer_chunk = alloc.chunk;
+            last_descriptor_buffer_generation = alloc.generation;
+            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+        }
+    }
+
+    scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
+    if (writes_storage) {
+        scheduler.NoteRenderPassStores();
+    }
+    if (!IsBuilt()) {
+        // Wait for the pipeline to be built
+        scheduler.Record([this](vk::CommandBuffer) {
+            const auto begin = std::chrono::steady_clock::now();
+            build->Wait(!worker_only_build);
+            hold_time_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - begin)
+                                       .count(),
+                                   std::memory_order::relaxed);
+        });
+    }
+    const bool is_rescaling{texture_cache.IsRescaling()};
+    const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
+    const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+    const bool push_mesh_draw_base{IsMeshPipeline() && MeshFirstEnabled()};
+    MeshDrawBaseLayout mesh_draw_base{};
+    if (push_mesh_draw_base) {
+        const u32 first{maxwell3d->draw_manager.draw_state.vertex_buffer.first};
+        (stage_infos[0].is_task ? mesh_draw_base.task : mesh_draw_base.mesh) = first;
+    }
+    const bool bind_descriptor_buffer{
+        descriptor_set_layout && uses_descriptor_buffer &&
+        scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+
+    // Log graphics pipeline binding
+    if (bind_pipeline && GPU::Logging::IsActive() &&
+        Settings::values.gpu_log_vulkan_calls.GetValue()) {
+        const std::string pipeline_info = fmt::format("hash={:#016x}", key.Hash());
+        GPU::Logging::GPULogger::GetInstance().LogPipelineBind(false, pipeline_info);
+    }
+
+    bool update_descriptors = true;
+    if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
+        const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
+        update_descriptors =
+            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+            std::memcmp(last_descriptor_payload.data(), entries,
+                        num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
+        if (update_descriptors) {
+            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+        }
+    }
+    scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
+                      descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
+                      rescaling_data = rescaling.Data(), is_rescaling, update_rescaling,
+                      uses_render_area = render_area.uses_render_area,
+                      render_area_data = render_area.words, push_mesh_draw_base,
+                      mesh_draw_base](vk::CommandBuffer cmdbuf) {
+        if (bind_descriptor_buffer) {
+            const VkDescriptorBufferBindingInfoEXT binding_info{
+                descriptor_buffer_ring.BindingInfo(descriptor_buffer_chunk)};
+            cmdbuf.BindDescriptorBuffersEXT(binding_info);
+        }
+        if (bind_pipeline) {
+            scheduler.SetGraphicsPipelineMissing(!pipeline || build->Failed());
+            if (!pipeline || build->Failed()) {
+                return;
+            }
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+        }
+        const VkShaderStageFlags push_stages =
+            IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
+                                   VK_SHADER_STAGE_MESH_BIT_EXT
+                             : VK_SHADER_STAGE_ALL_GRAPHICS;
+        cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                             sizeof(rescaling_data), rescaling_data.data());
+        if (update_rescaling) {
+            const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+            const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
+            cmdbuf.PushConstants(*pipeline_layout, push_stages,
+                                 RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
+                                 &scale_down_factor);
+        }
+        if (uses_render_area) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
+                                 sizeof(render_area_data), &render_area_data);
+        }
+        if (push_mesh_draw_base) {
+            cmdbuf.PushConstants(*pipeline_layout, push_stages, MESH_DRAW_BASE_OFFSET,
+                                 sizeof(mesh_draw_base), &mesh_draw_base);
+        }
+        if (!descriptor_set_layout) {
+            return;
+        }
+        if (uses_descriptor_buffer) {
+            const u32 buffer_index{};
+            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+                                                 0, buffer_index, descriptor_buffer_offset);
+        } else if (uses_push_descriptor) {
+            cmdbuf.PushDescriptorSetWithTemplateKHR(
+                *descriptor_update_template, *pipeline_layout, 0, descriptor_data,
+                num_descriptor_entries * sizeof(DescriptorUpdateEntry));
+        } else if (update_descriptors) {
+            const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
+            const vk::Device& dev{device.GetLogical()};
+            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
+                                      descriptor_set, nullptr);
+        }
+    });
+    return true;
+}
+
+void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+    if (IsMeshPipeline() && !device.IsExtMeshShaderSupported()) {
+        return;
+    }
+    FixedPipelineState::DynamicState dynamic{};
+    if (!key.state.extended_dynamic_state) {
+        dynamic = key.state.dynamic_state;
+    } else {
+        dynamic.raw1 = key.state.dynamic_state.raw1;
+    }
+    static_vector<VkVertexInputBindingDescription, 32> vertex_bindings;
+    static_vector<VkVertexInputBindingDivisorDescriptionEXT, 32> vertex_binding_divisors;
+    static_vector<VkVertexInputAttributeDescription, 32> vertex_attributes;
+    if (!key.state.dynamic_vertex_input) {
+        const size_t num_vertex_arrays = (std::min)(
+            Maxwell::NumVertexArrays, static_cast<size_t>(device.GetMaxVertexInputBindings()));
+        for (size_t index = 0; index < num_vertex_arrays; ++index) {
+            const bool instanced = key.state.binding_divisors[index] != 0;
+            const auto rate =
+                instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+            vertex_bindings.push_back({
+                .binding = static_cast<u32>(index),
+                .stride = key.state.vertex_strides[index],
+                .inputRate = rate,
+            });
+            if (instanced) {
+                vertex_binding_divisors.push_back({
+                    .binding = static_cast<u32>(index),
+                    .divisor = key.state.binding_divisors[index],
+                });
+            }
+        }
+        for (size_t index = 0; index < key.state.attributes.size(); ++index) {
+            const auto& attribute = key.state.attributes[index];
+            if (!attribute.enabled || !stage_infos[0].loads.Generic(index)) {
+                continue;
+            }
+            vertex_attributes.push_back({
+                .location = static_cast<u32>(index),
+                .binding = attribute.buffer,
+                .format = MaxwellToVK::VertexFormat(device, attribute.Type(), attribute.Size()),
+                .offset = attribute.offset,
+            });
+        }
+    }
+    ASSERT(vertex_attributes.size() <= device.GetMaxVertexInputAttributes());
+
+    VkPipelineVertexInputStateCreateInfo vertex_input_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .vertexBindingDescriptionCount = static_cast<u32>(vertex_bindings.size()),
+        .pVertexBindingDescriptions = vertex_bindings.data(),
+        .vertexAttributeDescriptionCount = static_cast<u32>(vertex_attributes.size()),
+        .pVertexAttributeDescriptions = vertex_attributes.data(),
+    };
+    const VkPipelineVertexInputDivisorStateCreateInfoEXT input_divisor_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .vertexBindingDivisorCount = static_cast<u32>(vertex_binding_divisors.size()),
+        .pVertexBindingDivisors = vertex_binding_divisors.data(),
+    };
+    if (!vertex_binding_divisors.empty()) {
+        vertex_input_ci.pNext = &input_divisor_ci;
+    }
+    const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+    auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
+    if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        if (!has_tess_stages) {
+            LOG_WARNING(Render_Vulkan, "Patch topology used without tessellation, using points");
+            input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        }
+    } else {
+        if (has_tess_stages) {
+            // The Vulkan spec requires patch list IA topology be used with tessellation
+            // shader stages. Forcing it fixes a crash on some drivers
+            LOG_WARNING(Render_Vulkan,
+                        "Patch topology not used with tessellation, using patch list");
+            input_assembly_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+        }
+    }
+    const VkPipelineInputAssemblyStateCreateInfo input_assembly_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .topology = input_assembly_topology,
+        .primitiveRestartEnable =
+        // MoltenVK/Metal always has primitive restart enabled and cannot disable it
+        device.IsMoltenVK() ? VK_TRUE :
+        (dynamic.primitive_restart_enable != 0 &&
+                ((input_assembly_topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
+                  device.IsTopologyListPrimitiveRestartSupported()) ||
+                 SupportsPrimitiveRestart(input_assembly_topology) ||
+                 (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
+                  device.IsPatchListPrimitiveRestartSupported()))
+            ? VK_TRUE
+            : VK_FALSE),
+    };
+    const VkPipelineTessellationStateCreateInfo tessellation_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .patchControlPoints = std::min(key.state.patch_control_points_minus_one.Value() + 1,
+                                       device.GetMaxTessellationPatchSize()),
+    };
+    std::array<VkViewportSwizzleNV, Maxwell::NumViewports> swizzles;
+    std::ranges::transform(key.state.viewport_swizzles, swizzles.begin(), UnpackViewportSwizzle);
+    VkPipelineViewportSwizzleStateCreateInfoNV swizzle_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_SWIZZLE_STATE_CREATE_INFO_NV,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = Maxwell::NumViewports,
+        .pViewportSwizzles = swizzles.data(),
+    };
+    VkPipelineViewportDepthClipControlCreateInfoEXT ndc_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .negativeOneToOne = key.state.ndc_minus_one_to_one.Value() != 0 ? VK_TRUE : VK_FALSE,
+    };
+    const u32 num_viewports = std::min<u32>(device.GetMaxViewports(), Maxwell::NumViewports);
+    VkPipelineViewportStateCreateInfo viewport_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .viewportCount = num_viewports,
+        .pViewports = nullptr,
+        .scissorCount = num_viewports,
+        .pScissors = nullptr,
+    };
+    if (device.IsNvViewportSwizzleSupported()) {
+        swizzle_ci.pNext = std::exchange(viewport_ci.pNext, &swizzle_ci);
+    }
+    if (device.IsExtDepthClipControlSupported()) {
+        ndc_info.pNext = std::exchange(viewport_ci.pNext, &ndc_info);
+    }
+    VkPipelineRasterizationStateCreateInfo rasterization_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthClampEnable =
+        static_cast<VkBool32>(dynamic.depth_clamp_disabled == 0 ? VK_TRUE : VK_FALSE),
+        .rasterizerDiscardEnable =
+        static_cast<VkBool32>(dynamic.rasterize_enable == 0 ? VK_TRUE : VK_FALSE),
+        .polygonMode =
+        MaxwellToVK::PolygonMode(FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode)),
+        .cullMode = static_cast<VkCullModeFlags>(
+            dynamic.cull_enable ? MaxwellToVK::CullFace(dynamic.CullFace()) : VK_CULL_MODE_NONE),
+        .frontFace = MaxwellToVK::FrontFace(dynamic.FrontFace()),
+        .depthBiasEnable = (dynamic.depth_bias_enable != 0 ? VK_TRUE : VK_FALSE),
+        .depthBiasConstantFactor = 0.0f,
+        .depthBiasClamp = 0.0f,
+        .depthBiasSlopeFactor = 0.0f,
+        .lineWidth = 1.0f,
+        // TODO(alekpop): Transfer from regs
+    };
+    const bool smooth_lines_supported =
+        device.IsExtLineRasterizationSupported() && device.SupportsSmoothLines();
+    const bool stippled_lines_supported =
+        device.IsExtLineRasterizationSupported() && device.SupportsStippledRectangularLines();
+    VkPipelineRasterizationLineStateCreateInfoEXT line_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .lineRasterizationMode = key.state.smooth_lines != 0 && smooth_lines_supported
+                                     ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_EXT
+                                     : VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT,
+        .stippledLineEnable =
+            (dynamic.line_stipple_enable && stippled_lines_supported) ? VK_TRUE : VK_FALSE,
+        .lineStippleFactor = key.state.line_stipple_factor,
+        .lineStipplePattern = static_cast<uint16_t>(key.state.line_stipple_pattern),
+    };
+    VkPipelineRasterizationConservativeStateCreateInfoEXT conservative_raster{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .flags = 0,
+        .conservativeRasterizationMode = key.state.conservative_raster_enable != 0
+                                             ? VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT
+                                             : VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT,
+        .extraPrimitiveOverestimationSize = 0.0f,
+    };
+    const bool supports_provoking_first_mode = device.SupportsProvokingVertexFirstMode();
+    const bool supports_provoking_last_mode = device.SupportsProvokingVertexLastMode();
+    const bool requested_provoking_last_mode = key.state.provoking_vertex_last != 0;
+    const VkProvokingVertexModeEXT provoking_vertex_mode =
+        requested_provoking_last_mode
+            ? (supports_provoking_last_mode ? VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT
+                                            : VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT)
+            : (supports_provoking_first_mode ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+                                             : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .provokingVertexMode = provoking_vertex_mode,
+    };
+
+    if (IsLine(input_assembly_topology) && device.IsExtLineRasterizationSupported()) {
+        line_state.pNext = std::exchange(rasterization_ci.pNext, &line_state);
+    }
+    if (device.IsExtConservativeRasterizationSupported()) {
+        conservative_raster.pNext = std::exchange(rasterization_ci.pNext, &conservative_raster);
+    }
+    if (device.IsExtProvokingVertexSupported()) {
+        provoking_vertex.pNext = std::exchange(rasterization_ci.pNext, &provoking_vertex);
+    }
+
+    const bool supports_alpha_output = fragment_has_color0_output;
+    const bool alpha_to_one_supported = device.SupportsAlphaToOne();
+    const VkPipelineMultisampleStateCreateInfo multisample_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .rasterizationSamples = MaxwellToVK::MsaaMode(key.state.msaa_mode),
+        .sampleShadingEnable = Settings::values.sample_shading.GetValue() > 0 ? VK_TRUE : VK_FALSE,
+        .minSampleShading = f32(Settings::values.sample_shading.GetValue()) / 100.0f,
+        .pSampleMask = nullptr,
+        .alphaToCoverageEnable =
+            supports_alpha_output && key.state.alpha_to_coverage_enabled != 0 ? VK_TRUE : VK_FALSE,
+        .alphaToOneEnable = supports_alpha_output && alpha_to_one_supported &&
+                           key.state.alpha_to_one_enabled != 0 ? VK_TRUE : VK_FALSE,
+    };
+    const VkPipelineDepthStencilStateCreateInfo depth_stencil_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .depthTestEnable = dynamic.depth_test_enable,
+        .depthWriteEnable = dynamic.depth_write_enable,
+        .depthCompareOp = dynamic.depth_test_enable
+                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              : VK_COMPARE_OP_ALWAYS,
+        .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
+        .stencilTestEnable = dynamic.stencil_enable,
+        .front = GetStencilFaceState(dynamic.front),
+        .back = GetStencilFaceState(dynamic.back),
+        .minDepthBounds = f32(key.state.depth_bounds_min),
+        .maxDepthBounds = f32(key.state.depth_bounds_max),
+    };
+    if (dynamic.depth_bounds_enable && !device.IsDepthBoundsSupported()) {
+        LOG_WARNING(Render_Vulkan, "Depth bounds is enabled but not supported");
+    }
+    static_vector<VkPipelineColorBlendAttachmentState, Maxwell::NumRenderTargets> cb_attachments;
+    const size_t num_attachments{NumAttachments(key.state)};
+    for (size_t index = 0; index < num_attachments; ++index) {
+        static constexpr std::array mask_table{
+            VK_COLOR_COMPONENT_R_BIT,
+            VK_COLOR_COMPONENT_G_BIT,
+            VK_COLOR_COMPONENT_B_BIT,
+            VK_COLOR_COMPONENT_A_BIT,
+        };
+        const auto& blend{key.state.attachments[index]};
+        const std::array mask{blend.Mask()};
+        VkColorComponentFlags write_mask{};
+        for (size_t i = 0; i < mask_table.size(); ++i) {
+            write_mask |= mask[i] ? mask_table[i] : 0;
+        }
+        // A target the fragment shader never writes gets undefined values in Vulkan; AMD's
+        // drivers store garbage (dark outlines around Ocarina's castle from a depth-test pass).
+        if (index >= fragment_writes_color.size() || !fragment_writes_color[index]) {
+            write_mask = 0;
+        }
+        cb_attachments.push_back({
+            .blendEnable = blend.enable != 0,
+            .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+            .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
+            .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),
+            .srcAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.SourceAlphaFactor()),
+            .dstAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.DestAlphaFactor()),
+            .alphaBlendOp = MaxwellToVK::BlendEquation(blend.EquationAlpha()),
+            .colorWriteMask = write_mask,
+        });
+    }
+    const VkPipelineColorBlendStateCreateInfo color_blend_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .logicOpEnable = dynamic.logic_op_enable != 0,
+        .logicOp = static_cast<VkLogicOp>(dynamic.logic_op.Value()),
+        .attachmentCount = static_cast<u32>(cb_attachments.size()),
+        .pAttachments = cb_attachments.data(),
+        .blendConstants = {}
+    };
+    static_vector<VkDynamicState, 34> dynamic_states{
+        VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_DEPTH_BOUNDS,       VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_LINE_WIDTH,
+    };
+    if (key.state.extended_dynamic_state) {
+        static constexpr std::array extended{
+            VK_DYNAMIC_STATE_CULL_MODE_EXT,
+            VK_DYNAMIC_STATE_FRONT_FACE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
+            VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT,
+            VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT,
+            VK_DYNAMIC_STATE_STENCIL_OP_EXT,
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT,
+        };
+        dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
+
+        // VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT
+        if (!key.state.dynamic_vertex_input) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
+        }
+    }
+
+    // VK_DYNAMIC_STATE_VERTEX_INPUT_EXT
+    if (key.state.dynamic_vertex_input) {
+        dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_EXT);
+    }
+
+    // EDS2 - Core (3 states)
+    if (key.state.extended_dynamic_state_2) {
+        static constexpr std::array extended2{
+            VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE_EXT,
+            VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT,
+            VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT,
+        };
+        dynamic_states.insert(dynamic_states.end(), extended2.begin(), extended2.end());
+    }
+
+    // EDS2 - LogicOp (granular)
+    if (key.state.extended_dynamic_state_2_logic_op) {
+        dynamic_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_EXT);
+    }
+
+    // EDS3 - Blending (composite: 3 states)
+    if (key.state.extended_dynamic_state_3_blend) {
+        static constexpr std::array extended3{
+            VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+            VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+            VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+        };
+        dynamic_states.insert(dynamic_states.end(), extended3.begin(), extended3.end());
+    }
+
+    // VK_EXT_color_write_enable fallback for fully on/off render targets when EDS3 blending is not available.
+    if (!key.state.extended_dynamic_state_3_blend && key.state.color_write_enable_dynamic) {
+        dynamic_states.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT);
+    }
+
+    // EDS3 - Enables (composite: per-feature)
+    if (key.state.extended_dynamic_state_3_enables) {
+        if (device.SupportsDynamicState3DepthClampEnable()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3LogicOpEnable()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3LineRasterizationMode()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT);
+        }
+        if (device.SupportsDynamicState3ConservativeRasterizationMode()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT);
+        }
+        if (device.SupportsDynamicState3LineStippleEnable()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_LINE_STIPPLE_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3AlphaToCoverageEnable()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+        }
+        if (device.SupportsDynamicState3AlphaToOneEnable()) {
+            dynamic_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_ONE_ENABLE_EXT);
+        }
+    }
+
+    const bool is_mesh{IsMeshPipeline()};
+    if (is_mesh) {
+        // Mesh pipelines have no vertex input or input assembly.
+        dynamic_states.erase(std::remove_if(dynamic_states.begin(), dynamic_states.end(),
+                                            [](VkDynamicState state) {
+                                                return state == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_EXT ||
+                                                       state == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT ||
+                                                       state == VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT;
+                                            }),
+                             dynamic_states.end());
+    }
+    const VkPipelineDynamicStateCreateInfo dynamic_state_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
+        .pDynamicStates = dynamic_states.data(),
+    };
+    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .pNext = nullptr,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+    for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+        if (!spv_modules[stage]) {
+            continue;
+        }
+        [[maybe_unused]] auto& stage_ci =
+            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .stage = StageFlag(stage_infos[stage],
+                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+                .module = *spv_modules[stage],
+                .pName = "main",
+                .pSpecializationInfo = nullptr,
+            });
+    }
+    VkPipelineCreateFlags flags{};
+    if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+        flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    if (uses_descriptor_buffer) {
+        flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+    // EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS=1: on AMD's proprietary driver, graphics pipelines are
+    // built without driver optimizations. Opt-in experiment for Ocarina of Time's crash inside
+    // vkCreateGraphicsPipelines around the Deku Tree (Eglantine #618: amdvlk64.dll access
+    // violation on one fragment shader, RDNA1/2/4); GPU time may go up.
+    static const bool safe_graphics = [] {
+        const char* const value = std::getenv("EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS");
+        return value != nullptr && value[0] == '1';
+    }();
+    // Two RX 6000 PCs on AMD's 2.0.353 driver died inside vkCreateGraphicsPipelines while these
+    // Ocarina fragment shaders compiled (all four were in flight both times). Like the large
+    // compute shaders, they are built without optimizations under EDEN_NX2_AMD_SAFE_COMPILE's rule:
+    // drivers older than 2.0.388 by default, any AMD proprietary driver with =1, never with =0.
+    static constexpr std::array<u64, 4> CRASHING_FRAGMENTS{
+        0x6c85c9f06e1d689bULL, 0x3d513889e2913d1cULL, 0x3c2193d0166610b3ULL, 0x4e54644c03577013ULL};
+    static const int safe_mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_AMD_SAFE_COMPILE");
+        return value == nullptr || value[0] == '\0' ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    const bool amd_proprietary = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+    const bool crashing_fragment =
+        amd_proprietary && safe_mode != 0 &&
+        (safe_mode == 1 || device.GetDriverVersion() < VK_MAKE_API_VERSION(0, 2, 0, 388)) &&
+        std::ranges::find(CRASHING_FRAGMENTS, key.unique_hashes[Maxwell::MaxShaderProgram - 1]) !=
+            CRASHING_FRAGMENTS.end();
+    const bool unoptimized = amd_proprietary && (safe_graphics || crashing_fragment);
+    if (unoptimized) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+
+    std::string compile_shaders;
+    if (LogPipelineCompiles()) {
+        for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage) {
+            if (key.unique_hashes[stage] != 0) {
+                compile_shaders += fmt::format("{}s{}:{:016x}", compile_shaders.empty() ? "" : " ",
+                                               stage, key.unique_hashes[stage]);
+            }
+        }
+    }
+    const PipelineCompileLog compile_log{unoptimized ? "graphics (unoptimized)" : "graphics",
+                                         std::move(compile_shaders)};
+    pipeline = device.GetLogical().CreateGraphicsPipeline({
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = flags,
+        .stageCount = static_cast<u32>(shader_stages.size()),
+        .pStages = shader_stages.data(),
+        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
+        .pViewportState = &viewport_ci,
+        .pRasterizationState = &rasterization_ci,
+        .pMultisampleState = &multisample_ci,
+        .pDepthStencilState = &depth_stencil_ci,
+        .pColorBlendState = &color_blend_ci,
+        .pDynamicState = &dynamic_state_ci,
+        .layout = *pipeline_layout,
+        .renderPass = render_pass,
+        .subpass = 0,
+        .basePipelineHandle = nullptr,
+        .basePipelineIndex = 0,
+    }, *pipeline_cache);
+
+    // Log graphics pipeline creation
+    if (GPU::Logging::IsActive()) {
+        const std::string pipeline_info = fmt::format(
+            "GraphicsPipeline created: stages={}, attachments={}",
+            shader_stages.size(),
+            color_blend_ci.attachmentCount
+        );
+        GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(pipeline_info);
+    }
+}
+
+void GraphicsPipeline::Validate() {
+    size_t num_images{};
+    for (const auto& info : stage_infos) {
+        num_images += Shader::NumDescriptors(info.texture_buffer_descriptors);
+        num_images += Shader::NumDescriptors(info.image_buffer_descriptors);
+        num_images += Shader::NumDescriptors(info.texture_descriptors);
+        num_images += Shader::NumDescriptors(info.image_descriptors);
+    }
+    ASSERT(num_images == num_image_elements);
+}
+
+} // namespace Vulkan

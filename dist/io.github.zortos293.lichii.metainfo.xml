@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.zortos293.lichii</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Lichii</name>
+  <summary>Experimental Nintendo Switch and Switch 2 emulator</summary>
+  <description>
+    <p>Lichii is an experimental open-source emulator fork based on Eglantine and Eden, with work inherited from yuzu and Sudachi. Compatibility and performance vary by game and hardware.</p>
+  </description>
+  <launchable type="desktop-id">io.github.zortos293.lichii.desktop</launchable>
+  <provides><binary>lichii</binary></provides>
+  <categories><category>Game</category><category>Emulator</category></categories>
+  <url type="homepage">https://github.com/zortos293/Eglantine</url>
+  <url type="bugtracker">https://github.com/zortos293/Eglantine/issues</url>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer_name>Lichii contributors</developer_name>
+  <content_rating type="oars-1.0"/>
+</component>

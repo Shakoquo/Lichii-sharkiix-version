@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450
+
+// One workgroup per tile of a colour target: the sum of each texel's mean channel magnitude, the
+// largest channel magnitude, the texels with a NaN or infinite channel and the texels at or above
+// the hot threshold.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D source;
+
+layout(binding = 1, std430) writeonly buffer Tiles {
+    uvec4 tiles[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uvec2 size;
+    uvec2 grid;
+    uint base;
+    uint channels;
+    float hot;
+};
+
+shared float shared_sum[64];
+shared float shared_peak[64];
+shared uint shared_bad[64];
+shared uint shared_hot[64];
+
+bool IsFinite(float value) {
+    return (floatBitsToUint(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+void main() {
+    const uvec2 tile = gl_WorkGroupID.xy;
+    const uvec2 begin = tile * size / grid;
+    const uvec2 end = (tile + 1u) * size / grid;
+    float sum = 0.0;
+    float peak = 0.0;
+    uint bad = 0u;
+    uint hot_count = 0u;
+    for (uint y = begin.y + gl_LocalInvocationID.y; y < end.y; y += 8u) {
+        for (uint x = begin.x + gl_LocalInvocationID.x; x < end.x; x += 8u) {
+            const vec4 texel = texelFetch(source, ivec2(x, y), 0);
+            bool finite = true;
+            float magnitude = 0.0;
+            float largest = 0.0;
+            for (uint c = 0u; c < channels; ++c) {
+                finite = finite && IsFinite(texel[c]);
+                magnitude += abs(texel[c]);
+                largest = max(largest, abs(texel[c]));
+            }
+            if (!finite) {
+                ++bad;
+                continue;
+            }
+            sum += magnitude / float(channels);
+            peak = max(peak, largest);
+            hot_count += largest >= hot ? 1u : 0u;
+        }
+    }
+    const uint index = gl_LocalInvocationIndex;
+    shared_sum[index] = sum;
+    shared_peak[index] = peak;
+    shared_bad[index] = bad;
+    shared_hot[index] = hot_count;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            shared_sum[index] += shared_sum[index + stride];
+            shared_peak[index] = max(shared_peak[index], shared_peak[index + stride]);
+            shared_bad[index] += shared_bad[index + stride];
+            shared_hot[index] += shared_hot[index + stride];
+        }
+        barrier();
+    }
+    if (index == 0u) {
+        tiles[base + tile.y * grid.x + tile.x] =
+            uvec4(floatBitsToUint(shared_sum[0]), floatBitsToUint(shared_peak[0]), shared_bad[0],
+                  shared_hot[0]);
+    }
+}
