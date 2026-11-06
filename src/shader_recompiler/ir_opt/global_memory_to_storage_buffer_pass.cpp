@@ -1125,7 +1125,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
                         if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) == candidates.end() &&
                             env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
@@ -1139,7 +1139,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             }
             const StorageBufferAddr pointer{.index = index.U32(), .offset = offset.U32()};
             if (Common::IsAligned(pointer.offset, 8) &&
-                std::ranges::find(candidates, pointer) == candidates.end() &&
+                std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) == candidates.end() &&
                 env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                 candidates.push_back(pointer);
             }
@@ -1202,7 +1202,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
             // table per object type: every slot whose table entry is a pointer). Those are table
             // candidates, bound only in the bindings the other storage buffers leave free.
             const auto add = [&](const StorageBufferAddr& pointer, bool table) {
-                if (std::ranges::find(candidates, pointer) != candidates.end()) {
+                if (std::ranges::find_if(candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) != candidates.end()) {
                     return;
                 }
                 if (table && env.ShaderStage() != Stage::Compute) {
@@ -1215,7 +1215,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                     if (!info.tables_enabled) {
                         return;
                     }
-                    if (std::ranges::find(info.table_candidates, pointer) ==
+                    if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& e) { return e == pointer; }) ==
                         info.table_candidates.end()) {
                         info.table_candidates.push_back(pointer);
                     }
@@ -1337,7 +1337,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
             for (const StorageBufferAddr& candidate : candidates) {
-                if (std::ranges::find(info.table_candidates, candidate) !=
+                if (std::ranges::find_if(info.table_candidates, [&](const StorageBufferAddr& e) { return e == candidate; }) !=
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
