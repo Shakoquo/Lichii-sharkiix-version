@@ -1193,6 +1193,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                      error ? fmt::format(" (failed: {})", error.message()) : std::string{});
         }
     }
+    if (const size_t imported = VideoCommon::ImportOtherPipelineCaches(
+            pipeline_cache_filename, CACHE_VERSION, sizeof(GraphicsPipelineCacheKey),
+            sizeof(ComputePipelineCacheKey));
+        imported != 0) {
+        LOG_INFO(Render_Vulkan, "Pipeline cache import: {} pipelines added from other caches",
+                 imported);
+    }
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;

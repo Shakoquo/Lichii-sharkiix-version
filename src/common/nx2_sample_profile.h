@@ -19,4 +19,7 @@ namespace Common::Nx2SampleProfile {
 /// the sampler with the first one.
 void OnThreadNamed(const char* name);
 
+/// Guest thread id (low byte) running on each emulated core, stored with each CPUCore_N sample.
+void SetGuestThread(unsigned core, unsigned long long thread_id);
+
 } // namespace Common::Nx2SampleProfile

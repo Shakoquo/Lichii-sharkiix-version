@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstring>
+#include <cstdlib>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -84,7 +86,10 @@ constexpr size_t MaxDepth = 32;
 struct SampledThread {
     HANDLE handle{};
     std::string name;
+    int core{-1};
 };
+
+std::array<std::atomic<std::uint8_t>, 16> guest_threads{};
 
 std::mutex threads_mutex;
 std::array<SampledThread, MaxThreads> sampled_threads;
@@ -216,7 +221,9 @@ void SamplerMain() {
             Put(file, KindSample);
             Put(file, static_cast<std::uint8_t>(index));
             Put(file, static_cast<std::uint8_t>(depth));
-            Put(file, static_cast<std::uint8_t>(0));
+            const int core = sampled_threads[index].core;
+            Put(file, core >= 0 ? guest_threads[core].load(std::memory_order_relaxed)
+                                : static_cast<std::uint8_t>(0));
             Put(file, static_cast<std::uint64_t>(now.QuadPart));
             file.write(reinterpret_cast<const char*>(frames.data()),
                        static_cast<std::streamsize>(depth * sizeof(std::uint64_t)));
@@ -265,11 +272,23 @@ void OnThreadNamed(const char* name) {
             CloseHandle(handle);
             return;
         }
-        sampled_threads[index] = {handle, name};
+        int core = -1;
+        if (std::strncmp(name, "CPUCore_", 8) == 0) {
+            core = std::atoi(name + 8);
+        }
+        sampled_threads[index] = {handle, name, core};
         num_threads.store(index + 1, std::memory_order_release);
     }
     static std::once_flag started;
     std::call_once(started, [] { std::thread{SamplerMain}.detach(); });
+#endif
+}
+
+void SetGuestThread(unsigned core, unsigned long long thread_id) {
+#ifdef _WIN32
+    if (core < guest_threads.size()) {
+        guest_threads[core].store(static_cast<std::uint8_t>(thread_id), std::memory_order_relaxed);
+    }
 #endif
 }
 

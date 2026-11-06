@@ -1,0 +1,81 @@
+# Switch NX2 - read when the Lichii GUI starts.
+# One NAME=VALUE per line. Lines starting with # are ignored.
+# A variable already set in the environment wins over this file.
+# Between files, the user copy (%APPDATA%\eden\nx2_switches.txt, or
+# $XDG_CONFIG_HOME/eden/nx2_switches.txt) wins over this one, so editing this file is never
+# needed: copy the lines you want into your own and restart.
+#
+# Restart the emulator after editing.
+
+# --- Performance tuning defaults for Switch 2 ---
+# Offload GPU method/macro execution to the back thread (SPLIT=2 delivers up to +54% FPS alone).
+EDEN_NX2_SPLIT=2
+
+# Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes.
+EDEN_NX2_FENCE_BATCH=1
+
+# Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) copies back
+# 90-220 MB/s of buffers CPU never touches, causing heavy mutex contention and dropping FPS by ~38-63%.
+#EDEN_NX2_BUFFER_DOWNLOADS=1
+
+# Paces frame submission 2 frames ahead. Reduces frametime spikes, but adds ~1-2 frames of input latency.
+# Enable only if frame pacing stability is preferred over responsive controls.
+#EDEN_NX2_FRAMES_AHEAD=2
+
+# --- Workarounds / Debug ---
+# Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
+#EDEN_NX2_RESETFIX=0
+
+# Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
+#EDEN_NX2_NO_REACTIVE=1
+
+#EDEN_NX2_MME_JIT=0
+#EDEN_NX2_PBFLUSH=0
+#EDEN_NX2_SKIP_SAME=0
+#EDEN_NX2_INLINE_DEFER=0
+#EDEN_NX2_SPLIT_SKIP=1
+#EDEN_NX2_AUTO_STUB=1
+#EDEN_NX2_KEEP_ASTC=1
+
+# --- chuppatricky-amd-testbuild (Ocarina of Time on AMD) ---
+# Ocarina of Time fog: reduced, on, off or original. Change the value below, or put the line in your own
+# %APPDATA%\eden\nx2_switches.txt (it wins over this file) and restart.
+#   reduced: the outdoor haze thinned to 1/4 and the final exposure lowered to 0.65 (closer to the
+#            console; the default here)
+#   on:      the game's full fog as this emulator draws it (thicker than on the console),
+#            exposure 0.65
+#   off:     no fog at all, exposure 0.65
+#   original: no changes at all: full fog and the emulator's brighter image
+# Older builds' EDEN_NX2_OOT_VISUAL_WORKAROUND=0 now means "original".
+EDEN_NX2_OOT_FOG=reduced
+
+# Builds every cached shader pipeline at boot instead of when first needed. Ocarina's cache is a few
+# hundred pipelines, so boot takes a little longer and areas you've visited before stop stuttering.
+# To turn it off: EDEN_NX2_PRELOAD_ALL_PIPELINES=0
+EDEN_NX2_PRELOAD_ALL_PIPELINES=1
+
+# Diagnostic: logs each shader compile as it starts and finishes, so a log from a PC that freezes
+# shows the shader the graphics driver hangs on. Adds a few hundred lines to the log.
+EDEN_NX2_LOG_PIPELINE_COMPILES=1
+
+# Radeon RX 5000/6000 on Windows (AMD driver older than 2.0.388): the largest compute shaders are
+# built without driver optimizations, since that driver froze compiling one of them at the title
+# screen. Automatic; EDEN_NX2_AMD_SAFE_COMPILE=0 turns it off, =1 forces it on any AMD driver.
+# EDEN_NX2_AMD_SAFE_COMPILE_MIN_KIB=0 applies it to every compute shader if the freeze remains.
+
+# Radeon on Windows: if the game closes by itself with no error around the Deku Tree (the log just
+# stops), remove the "# " in front of the next line. Experimental: graphics shaders are then built
+# without driver optimizations too, which may cost some speed.
+# EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS=1
+
+# "Device loss occurred" soon after gameplay starts (RX 9070 XT, 9060 XT, 7800 XT): v13 fixes the
+# shader loop that hung the GPU. If it still happens, first remove the "# " in front of the next
+# line and send the log: it records which shaders the GPU was running when it hung.
+# EDEN_NX2_GPU_BREADCRUMBS=1
+# Last resort: remove the "# " in front of the next line. It skips the six fog, lighting and
+# vegetation compute shaders the Max Resolution mode added: less fog, light and grass.
+# EDEN_NX2_REJECT_HASH=0051f3226c2ac35e,7ca59d64e659a9e1,9a24d120a5fa2a93,affbb36232fcda8f,e311d97dbe057ad3,394cb954427f6336
+
+# --- sharkiix v3 ---
+# Verrouillage a 30 images/s (rythme parfaitement regulier). Enlevez le # pour l'activer.
+#EDEN_NX2_SWAP_INTERVAL=2

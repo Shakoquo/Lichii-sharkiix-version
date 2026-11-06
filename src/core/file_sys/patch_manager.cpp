@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <array>
 #include <cstddef>
@@ -94,6 +95,17 @@ constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
 };
 
+// Native zstd: the two calls to ZSTD_decompressMultiFrame (main+0xEB380) become svc 0xF0 / 0xF1,
+// decompressed by the host (Kernel::Svc::Call, svc.cpp). Same output as the game's decoder.
+constexpr std::array<u8, 4> NATIVE_ZSTD_SVC_F0{0x01, 0x1E, 0x00, 0xD4}; // svc #0xf0
+constexpr std::array<u8, 4> NATIVE_ZSTD_SVC_F1{0x21, 0x1E, 0x00, 0xD4}; // svc #0xf1
+constexpr std::array NATIVE_ZSTD_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0xBF72E0, .bytes = NATIVE_ZSTD_SVC_F0, .checked = true,
+                       .original = 0x97D3D028},
+    BuiltinPatchRecord{.module_offset = 0xF50164, .bytes = NATIVE_ZSTD_SVC_F1, .checked = true,
+                       .original = 0x97C66C87},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
@@ -108,6 +120,13 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
+    },
+    BuiltinPatch{
+        .name = "Native zstd (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = NATIVE_ZSTD_RECORDS,
     },
 };
 
@@ -583,6 +602,53 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
                  patch.records.size(), name);
+    }
+
+    // EDEN_NX2_PROBE=<off>,<off>,... (analysis only): main's pacibsp at each offset becomes
+    // svc #0xF8+i, which counts the calls and their callers (svc.cpp) and goes on as the hint did.
+    if (const char* probe = std::getenv("EDEN_NX2_PROBE"); probe != nullptr && name == "main") {
+        u32 index = 0;
+        for (const char* p = probe; *p != 0 && index < 8;) {
+            char* end{};
+            const u64 module_offset = std::strtoull(p, &end, 16);
+            if (end == p) break;
+            const size_t offset = sizeof(Loader::NSOHeader) + module_offset;
+            u32 original{};
+            if (out.size() >= offset + 4) std::memcpy(&original, out.data() + offset, 4);
+            if (original == 0xD503237F || original == 0xD503233F) {
+                const u32 svc = 0xD4000001 | ((0xF8 + index) << 5);
+                std::memcpy(out.data() + offset, &svc, 4);
+                LOG_INFO(Loader, "    - Probe {} at main+{:#x}", index, module_offset);
+            } else {
+                LOG_WARNING(Loader, "    - Probe {} at main+{:#x}: not a pacibsp ({:#010x})", index,
+                            module_offset, original);
+            }
+            ++index;
+            p = *end == ',' ? end + 1 : end;
+        }
+        // Return trampoline (svc #0xF7) in the unused space after the code, past Dynamic FPS's.
+        const size_t tramp = sizeof(Loader::NSOHeader) + 0x3C46400;
+        u32 old{};
+        if (out.size() >= tramp + 4) std::memcpy(&old, out.data() + tramp, 4);
+        if (old == 0) {
+            const u32 svc = 0xD4000001 | (0xF7 << 5);
+            std::memcpy(out.data() + tramp, &svc, 4);
+        } else {
+            LOG_WARNING(Loader, "    - Probe return trampoline: main+0x3c46400 is not free");
+        }
+    }
+
+    // EDEN_NX2_DYNFPS_LOG=1 (analysis only): Dynamic FPS's ret becomes svc #0xF6, which logs the
+    // frame step it returns (Kernel::Svc::Call) and returns.
+    if (std::getenv("EDEN_NX2_DYNFPS_LOG") != nullptr && name == "main") {
+        const size_t at = sizeof(Loader::NSOHeader) + 0x3C46270;
+        u32 old{};
+        if (out.size() >= at + 4) std::memcpy(&old, out.data() + at, 4);
+        if (old == 0xD65F03C0) {
+            const u32 svc = 0xD4000001 | (0xF6 << 5);
+            std::memcpy(out.data() + at, &svc, 4);
+            LOG_INFO(Loader, "    - Dynamic FPS log at main+0x3c46270");
+        }
     }
 
     if (out.size() < sizeof(Loader::NSOHeader)) {

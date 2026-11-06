@@ -9,10 +9,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include <array>
+#include <atomic>
+#include <vector>
+#include <zstd.h>
+#include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <fmt/format.h>
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -2500,6 +2512,202 @@ static void Call64(Core::System& system, u32 imm, std::span<uint64_t, 8> args) {
     default: UNREACHABLE_MSG("Unhandled SVC {:#x}!", imm);
     }
 }
+// Ocarina of Time (Switch 2): the game decompresses zstd data on its main threads all the time
+// (~25-40% of their time outdoors, in ZSTD_decompressMultiFrame at main+0xEB380). The built-in
+// patch "Native zstd" turns its two one-shot calls (no dictionary; the callers reset the context
+// first and only read the output) into svc 0xF0 / 0xF1, decompressed here by the host's zstd:
+// the same format, so the same bytes. Anything unusual (a dictionary, an error, a huge buffer)
+// runs the game's own function instead. EDEN_NX2_ZSTD_NATIVE=0 always runs the game's function.
+namespace {
+constexpr u64 Nx2ZstdFunction = 0xEB380;
+constexpr std::array<u64, 2> Nx2ZstdCallSites{0xBF72E0, 0xF50164};
+
+bool Nx2ZstdNative(Core::System& system, KProcess& process, u32 imm, std::array<uint64_t, 8>& args) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ZSTD_NATIVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    const u64 dst = args[1], capacity = args[2], src = args[3], src_size = args[4];
+    if (!enabled || args[5] != 0 || args[6] != 0 || args[7] != 0 || capacity > (512ULL << 20) ||
+        src_size > (512ULL << 20)) {
+        return false;
+    }
+    auto& memory = process.GetMemory();
+    if (!memory.IsValidVirtualAddressRange(src, src_size) ||
+        !memory.IsValidVirtualAddressRange(dst, capacity)) {
+        return false;
+    }
+    thread_local std::vector<u8> input;
+    thread_local std::vector<u8> output;
+    input.resize(src_size);
+    memory.ReadBlock(src, input.data(), src_size);
+    if (output.size() < capacity) {
+        output.resize(capacity);
+    }
+    const size_t result = ZSTD_decompress(output.data(), capacity, input.data(), src_size);
+    if (ZSTD_isError(result)) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1) < 16) {
+            LOG_WARNING(Kernel_SVC, "Native zstd: {} on {:#x} bytes; running the game's own decoder",
+                        ZSTD_getErrorName(result), src_size);
+        }
+        return false;
+    }
+    memory.WriteBlock(dst, output.data(), result);
+    args[0] = result;
+    static std::atomic<u64> calls{};
+    static std::atomic<u64> bytes{};
+    bytes.fetch_add(result, std::memory_order_relaxed);
+    if (const u64 n = calls.fetch_add(1, std::memory_order_relaxed) + 1; n == 1 || n % 20000 == 0) {
+        LOG_INFO(Kernel_SVC, "Native zstd (svc {:#x}): {} calls, {} MiB decompressed", imm, n,
+                 bytes.load(std::memory_order_relaxed) >> 20);
+    }
+    return true;
+}
+
+// The patched call site runs the game's function after all: call it as the bl did.
+void Nx2ZstdRunGuest(Core::System& system, KProcess& process, u32 imm) {
+    auto& kernel = system.Kernel();
+    auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
+    Svc::ThreadContext ctx{};
+    arm->GetContext(ctx);
+    const u64 return_address = ctx.pc; // after the svc, where the bl returned to
+    const u64 module_base = return_address - 4 - Nx2ZstdCallSites[imm - 0xF0];
+    ctx.lr = return_address;
+    ctx.pc = module_base + Nx2ZstdFunction;
+    arm->SetContext(ctx);
+}
+struct Nx2ProbeFrame {
+    u64 lr;
+    u32 index;
+};
+std::unordered_map<u64, std::vector<Nx2ProbeFrame>>& Nx2ProbeReturns() {
+    static std::unordered_map<u64, std::vector<Nx2ProbeFrame>> stacks;
+    return stacks;
+}
+std::mutex& Nx2ProbeMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+void Nx2ProbeReturn(Core::System& system, KProcess& process, std::array<uint64_t, 8>& args) {
+    auto& kernel = system.Kernel();
+    auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
+    Svc::ThreadContext ctx{};
+    arm->GetContext(ctx);
+    static std::array<std::unordered_map<u64, u64>, 8> results{};
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lock{Nx2ProbeMutex()};
+    auto& stack = Nx2ProbeReturns()[GetCurrentThread(kernel).GetThreadId()];
+    if (stack.empty()) {
+        LOG_CRITICAL(Kernel_SVC, "Probe return with no frame");
+        return;
+    }
+    const Nx2ProbeFrame frame = stack.back();
+    stack.pop_back();
+    ++results[frame.index][args[0]];
+    ctx.pc = frame.lr;
+    arm->SetContext(ctx);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::seconds{5}) {
+        last = now;
+        for (u32 i = 0; i < 8; ++i) {
+            if (results[i].empty()) continue;
+            std::string text;
+            for (auto& [value, n] : results[i]) text += fmt::format(" {:#x}x{}", value, n);
+            LOG_INFO(Kernel_SVC, "Probe {} returned:{}", i, text.substr(0, 400));
+            results[i].clear();
+        }
+    }
+}
+
+// EDEN_NX2_PROBE (patch_manager.cpp): counts calls per probe and the most frequent callers.
+void Nx2Probe(Core::System& system, KProcess& process, u32 imm, std::array<uint64_t, 8>& args) {
+    auto& kernel = system.Kernel();
+    auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
+    Svc::ThreadContext ctx{};
+    arm->GetContext(ctx);
+    static std::array<u64, 8> counts{};
+    static std::array<std::unordered_map<u64, u64>, 8> callers{};
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lock{Nx2ProbeMutex()};
+    const u32 index = imm - 0xF8;
+    ++counts[index];
+    ++callers[index][ctx.lr];
+    // Return capture: the function returns to the trampoline (svc 0xF7, Nx2ProbeReturn), which
+    // records x0 and goes on at the real return address.
+    static const std::vector<u64> offsets = [] {
+        std::vector<u64> list;
+        for (const char* p = std::getenv("EDEN_NX2_PROBE"); p && *p;) {
+            char* end{};
+            list.push_back(std::strtoull(p, &end, 16));
+            if (end == p) break;
+            p = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if (index < offsets.size()) {
+        const u64 base = ctx.pc - 4 - offsets[index];
+        Nx2ProbeReturns()[GetCurrentThread(kernel).GetThreadId()].push_back({ctx.lr, index});
+        ctx.lr = base + 0x3C46400;
+        arm->SetContext(ctx);
+    }
+    // x2 as a path: the distinct strings seen (loaders take a file name there).
+    static std::array<std::unordered_map<std::string, u64>, 8> paths{};
+    if (process.GetMemory().IsValidVirtualAddressRange(args[2], 1)) {
+        std::string text;
+        for (u64 k = 0; k < 160; ++k) {
+            const u8 c = process.GetMemory().Read8(args[2] + k);
+            if (c == 0) break;
+            text.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
+        }
+        if (text.size() >= 3) ++paths[index][text];
+    }
+    // Content check: x3/x4 as (pointer, size); a hash of the first 256 bytes says whether the
+    // same input comes back (seen before in this run) or is new.
+    static std::array<std::unordered_map<u64, u64>, 8> seen{};
+    static std::array<u64, 8> repeats{};
+    static std::array<u64, 8> bytes{};
+    {
+        const u64 pointer = args[3], size = args[4];
+        if (size > 0 && size < (64ULL << 20) &&
+            process.GetMemory().IsValidVirtualAddressRange(pointer, std::min<u64>(size, 256))) {
+            std::array<u8, 256> head{};
+            const size_t n = static_cast<size_t>(std::min<u64>(size, 256));
+            process.GetMemory().ReadBlock(pointer, head.data(), n);
+            u64 hash = 1469598103934665603ULL ^ size;
+            for (size_t k = 0; k < n; ++k) hash = (hash ^ head[k]) * 1099511628211ULL;
+            if (seen[index][hash]++ > 0) ++repeats[index];
+            bytes[index] += size;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::seconds{5}) {
+        last = now;
+        for (u32 i = 0; i < 8; ++i) {
+            if (counts[i] == 0) continue;
+            std::vector<std::pair<u64, u64>> top(callers[i].begin(), callers[i].end());
+            std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            std::string text;
+            for (size_t j = 0; j < std::min<size_t>(6, top.size()); ++j)
+                text += fmt::format(" {:#x}x{}", top[j].first, top[j].second);
+            LOG_INFO(Kernel_SVC, "Probe {}: {} calls in 5 s ({} with an input seen before, {} KiB in, {} distinct inputs so far), callers{}",
+                     i, counts[i], repeats[i], bytes[i] >> 10, seen[i].size(), text);
+            repeats[i] = 0;
+            bytes[i] = 0;
+            std::vector<std::pair<u64, std::string>> names;
+            for (auto& [name, n] : paths[i]) names.emplace_back(n, name);
+            std::sort(names.rbegin(), names.rend());
+            for (size_t j = 0; j < std::min<size_t>(8, names.size()); ++j)
+                LOG_INFO(Kernel_SVC, "Probe {}:   x2 \"{}\" x{}", i, names[j].second, names[j].first);
+            paths[i].clear();
+            counts[i] = 0;
+            callers[i].clear();
+        }
+    }
+}
+} // Anonymous namespace
+
 void Call(Core::System& system, u32 imm) {
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
@@ -2510,6 +2718,40 @@ void Call(Core::System& system, u32 imm) {
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    // Set EDEN_NX2_THREAD_STATS=1 to log, every 5 s, the guest threads by CPU time.
+    static const bool thread_stats = std::getenv("EDEN_NX2_THREAD_STATS") != nullptr;
+    if (thread_stats) {
+        static std::mutex stats_mutex;
+        static auto stats_last = std::chrono::steady_clock::now();
+        static std::unordered_map<u64, s64> stats_prev;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - stats_last > std::chrono::seconds(5) && stats_mutex.try_lock()) {
+            stats_last = now;
+            struct Row { u64 id; s64 delta; s32 core; s32 prio; u64 mask; u64 entry; };
+            std::vector<Row> rows;
+            s64 total = 0;
+            {
+                KScopedSchedulerLock sl{kernel};
+                for (auto& t : process.GetThreadList()) {
+                    const s64 cpu = t.GetCpuTime();
+                    const s64 d = cpu - stats_prev[t.GetThreadId()];
+                    stats_prev[t.GetThreadId()] = cpu;
+                    total += d;
+                    rows.push_back({t.GetThreadId(), d, t.GetActiveCore(), t.GetPriority(),
+                                    t.GetAffinityMask().GetAffinityMask(), t.GetArgument()});
+                }
+            }
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.delta > b.delta; });
+            std::string text;
+            for (size_t i = 0; i < std::min<size_t>(rows.size(), 24); ++i) {
+                text += fmt::format(" | t{} {:.1f}% c{} p{} m{:x}", rows[i].id,
+                                    total ? 100.0 * rows[i].delta / total : 0.0, rows[i].core,
+                                    rows[i].prio, rows[i].mask);
+            }
+            LOG_INFO(Kernel_SVC, "Nx2ThreadStats total={} ticks{}", total, text);
+            stats_mutex.unlock();
+        }
+    }
     // Set EDEN_NX2_SVC_TRACE=1 to log every SVC with its arguments and results, or
     // EDEN_NX2_SVC_TRACE=<first>:<last> for presents first..last only (a frame-time profile).
     static const std::pair<u64, u64> trace_range = [] {
@@ -2541,7 +2783,47 @@ void Call(Core::System& system, u32 imm) {
             LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
         }
     }
-    if (imm == 0x80) {
+    if (imm == 0xF6 && process.Is64Bit() && process.GetProgramId() == 0x0400486024DEC000 &&
+        std::getenv("EDEN_NX2_DYNFPS_LOG") != nullptr) {
+        auto* const arm = process.GetArmInterface(kernel.CurrentPhysicalCoreIndex());
+        Svc::ThreadContext ctx{};
+        arm->GetContext(ctx);
+        const auto f = [&](size_t i) {
+            float value;
+            const u32 bits = static_cast<u32>(ctx.v[i][0]);
+            std::memcpy(&value, &bits, sizeof(value));
+            return value;
+        };
+        static auto last = std::chrono::steady_clock::now();
+        static const auto first = std::chrono::steady_clock::now();
+        static u64 calls = 0;
+        static double game_seconds = 0.0;
+        ++calls;
+        if (f(1) > 0.0f) {
+            game_seconds += static_cast<double>(f(8)) / static_cast<double>(f(1));
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::milliseconds(500)) {
+            last = now;
+            const double real = std::chrono::duration<double>(now - first).count();
+            LOG_INFO(Kernel_SVC, "Nx2DynFps calls={} s0={} s1={} step={} smoothed_ticks={} game_s={:.2f} real_s={:.2f} behind={:.2f}",
+                     calls, f(0), f(1), f(8), ctx.r[12], game_seconds, real, real - game_seconds);
+        }
+        ctx.pc = ctx.lr;
+        arm->SetContext(ctx);
+        return;
+    }
+    if (imm == 0xF7 && process.Is64Bit() && process.GetProgramId() == 0x0400486024DEC000 &&
+        std::getenv("EDEN_NX2_PROBE") != nullptr) {
+        Nx2ProbeReturn(system, process, args);
+    } else if (imm >= 0xF8 && imm <= 0xFF && process.Is64Bit() &&
+        process.GetProgramId() == 0x0400486024DEC000 && std::getenv("EDEN_NX2_PROBE") != nullptr) {
+        Nx2Probe(system, process, imm, args);
+    } else if ((imm == 0xF0 || imm == 0xF1) && process.Is64Bit() &&
+        process.GetProgramId() == 0x0400486024DEC000) {
+        if (!Nx2ZstdNative(system, process, imm, args)) {
+            Nx2ZstdRunGuest(system, process, imm);
+        }
+    } else if (imm == 0x80) {
         // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
         // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering
         // memory with the GPU and clear it on destruction; NVN can see it through QueryMemory.

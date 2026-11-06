@@ -10,6 +10,11 @@
 #include <immintrin.h>
 #endif
 #include "common/settings.h"
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+#include <fmt/format.h>
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
@@ -61,6 +66,20 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (last_code_addr != aligned_vaddr) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        // EDEN_NX2_CODE_DUMP=<dir>: saves each guest code page the JIT reads (analysis only).
+        static const char* const code_dump_dir = std::getenv("EDEN_NX2_CODE_DUMP");
+        if (code_dump_dir != nullptr) {
+            static std::mutex dump_mutex;
+            static std::unordered_set<u64> dumped;
+            std::scoped_lock lock{dump_mutex};
+            if (dumped.insert(aligned_vaddr).second) {
+                const std::string path = fmt::format("{}/{:016x}.bin", code_dump_dir, aligned_vaddr);
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(&cached_code_page, sizeof(cached_code_page), 1, file);
+                    std::fclose(file);
+                }
+            }
+        }
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {

@@ -137,6 +137,13 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             R_SUCCEED();
         case InfoType::UsedNonSystemMemorySize:
             *result = process->GetUsedNonSystemUserPhysicalMemorySize(system.Kernel());
+            if (std::getenv("EDEN_NX2_MEMINFO_LOG")) {
+                static int n = 0;
+                if ((n++ % 30) == 0) {
+                    LOG_INFO(Kernel_SVC, "Nx2MemInfo used={:#x} total={:#x}", *result,
+                             process->GetTotalNonSystemUserPhysicalMemorySize(system.Kernel()));
+                }
+            }
             R_SUCCEED();
         case InfoType::IsApplication:
             *result = process->IsApplication();

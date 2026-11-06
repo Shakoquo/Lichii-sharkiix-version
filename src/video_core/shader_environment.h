@@ -286,6 +286,14 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
+/// Appends to `own` the pipelines of the other cache files in its folder (vulkan*.bin of this
+/// cache version, e.g. a cache another player shared) that it lacks. A file is taken only if it
+/// has this cache version and every record in it reads to its exact end; anything else is left
+/// alone. Each
+/// file is read once (listed in <own>.imported.txt). Returns the number of records added.
+size_t ImportOtherPipelineCaches(const std::filesystem::path& own, u32 cache_version,
+                                 size_t graphics_key_size, size_t compute_key_size);
+
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);

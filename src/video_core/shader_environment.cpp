@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <vector>
+#include <iterator>
+#include <span>
+#include <unordered_set>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -1273,6 +1277,170 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
     }
+}
+
+namespace {
+// One cache record: its bytes, and its key's bytes (the dedup key).
+struct ImportedRecord {
+    std::string bytes;
+    std::string key;
+};
+
+// Reads every record of a cache file; nullopt unless all of them read to the file's exact end.
+std::optional<std::vector<ImportedRecord>> ReadAllRecords(const std::filesystem::path& path,
+                                                          size_t graphics_key_size,
+                                                          size_t compute_key_size,
+                                                          u32 cache_version) try {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return std::nullopt;
+    }
+    file.exceptions(std::ifstream::failbit);
+    const std::streamoff end = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::array<char, 8> magic{};
+    u32 version{};
+    file.read(magic.data(), magic.size()).read(reinterpret_cast<char*>(&version), sizeof(version));
+    // Other cache versions read with the same sizes but mean other things (an import of them
+    // aborted at boot): only this version's files from other players or profiles merge.
+    if (magic != MAGIC_NUMBER || version != cache_version) {
+        return std::nullopt;
+    }
+    std::vector<ImportedRecord> records;
+    std::string raw;
+    while (static_cast<std::streamoff>(file.tellg()) != end) {
+        const std::streamoff start = file.tellg();
+        u32 num_envs{};
+        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        if (num_envs == 0 || num_envs > 6) {
+            return std::nullopt;
+        }
+        bool compute = false;
+        for (u32 i = 0; i < num_envs; ++i) {
+            // The counts lead each environment: reject what this format can't hold before
+            // Deserialize sizes vectors from them.
+            const std::streamoff env_start = file.tellg();
+            std::array<u64, 6> counts{};
+            file.read(reinterpret_cast<char*>(counts.data()), sizeof(counts));
+            if (counts[0] == 0 || counts[0] > (16u << 20) || counts[0] % 8 != 0 ||
+                std::any_of(counts.begin() + 1, counts.end(),
+                            [](u64 count) { return count > 65536; })) {
+                return std::nullopt;
+            }
+            file.seekg(env_start);
+            FileEnvironment env;
+            env.Deserialize(file);
+            if (static_cast<u32>(env.ShaderStage()) > static_cast<u32>(Shader::Stage::Mesh)) {
+                return std::nullopt;
+            }
+            if (i == 0) {
+                compute = env.ShaderStage() == Shader::Stage::Compute;
+            } else if (env.ShaderStage() == Shader::Stage::Compute) {
+                return std::nullopt;
+            }
+        }
+        if (compute && num_envs != 1) {
+            return std::nullopt;
+        }
+        const size_t key_size = compute ? compute_key_size : graphics_key_size;
+        const std::streamoff key_start = file.tellg();
+        if (key_start + static_cast<std::streamoff>(key_size) > end) {
+            return std::nullopt;
+        }
+        const std::streamoff record_end = key_start + static_cast<std::streamoff>(key_size);
+        raw.resize(static_cast<size_t>(record_end - start));
+        file.seekg(start);
+        file.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        records.push_back({raw, raw.substr(static_cast<size_t>(key_start - start))});
+    }
+    return records;
+} catch (const std::exception&) {
+    return std::nullopt;
+}
+} // Anonymous namespace
+
+size_t ImportOtherPipelineCaches(const std::filesystem::path& own, u32 cache_version,
+                                 size_t graphics_key_size, size_t compute_key_size) try {
+    if (const char* value = std::getenv("EDEN_NX2_IMPORT_CACHES"); value && value[0] == '0') {
+        return 0;
+    }
+    const std::filesystem::path dir = own.parent_path();
+    std::filesystem::path list_path = own;
+    list_path += ".imported.txt";
+    std::string done;
+    if (std::ifstream list(list_path, std::ios::binary); list.is_open()) {
+        done.assign(std::istreambuf_iterator<char>(list), std::istreambuf_iterator<char>());
+    }
+    std::vector<std::filesystem::path> candidates;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
+        if (!entry.is_regular_file(error) || entry.path() == own) {
+            continue;
+        }
+        const std::string name = Common::FS::PathToUTF8String(entry.path().filename());
+        if (!name.starts_with("vulkan") || !name.ends_with(".bin") ||
+            name.find("_used") != std::string::npos || name.find("_pipelines") != std::string::npos ||
+            name.find("static") != std::string::npos) {
+            continue;
+        }
+        const std::string tag = fmt::format("{} {}\n", name, entry.file_size(error));
+        if (done.find(tag) != std::string::npos) {
+            continue;
+        }
+        candidates.push_back(entry.path());
+    }
+    if (candidates.empty()) {
+        return 0;
+    }
+    std::unordered_set<std::string> keys;
+    if (std::filesystem::exists(own, error)) {
+        const auto mine = ReadAllRecords(own, graphics_key_size, compute_key_size, cache_version);
+        if (!mine) {
+            LOG_WARNING(Render_Vulkan, "Pipeline cache import: this build's own cache does not read "
+                                       "to its end; nothing imported");
+            return 0;
+        }
+        for (const auto& record : *mine) {
+            keys.insert(record.key);
+        }
+    }
+    size_t added = 0;
+    {
+        // tellp() reads 0 on a file opened for appending until the first write: a second header
+        // in the middle of the file made every build abort reading it.
+        const bool has_header = std::filesystem::exists(own, error) &&
+                                std::filesystem::file_size(own, error) >= MAGIC_NUMBER.size() + sizeof(u32);
+        std::ofstream out(own, std::ios::binary | std::ios::app);
+        out.exceptions(std::ofstream::failbit);
+        if (!has_header) {
+            out.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+                .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
+        }
+        std::ofstream list(list_path, std::ios::binary | std::ios::app);
+        for (const auto& path : candidates) {
+            const std::string name = Common::FS::PathToUTF8String(path.filename());
+            const auto records = ReadAllRecords(path, graphics_key_size, compute_key_size, cache_version);
+            size_t file_added = 0;
+            if (records) {
+                for (const auto& record : *records) {
+                    if (keys.insert(record.key).second) {
+                        out.write(record.bytes.data(),
+                                  static_cast<std::streamsize>(record.bytes.size()));
+                        ++file_added;
+                    }
+                }
+            }
+            LOG_INFO(Render_Vulkan, "Pipeline cache import: {} {} ({} records, {} new)", name,
+                     records ? "read" : "skipped (another cache version or format)",
+                     records ? records->size() : size_t{0}, file_added);
+            added += file_added;
+            list << fmt::format("{} {}\n", name, std::filesystem::file_size(path, error));
+        }
+    }
+    return added;
+} catch (const std::exception& e) {
+    LOG_ERROR(Render_Vulkan, "Pipeline cache import failed: {}", e.what());
+    return 0;
 }
 
 void LoadPipelines(
