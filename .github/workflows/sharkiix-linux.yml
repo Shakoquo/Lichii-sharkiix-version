@@ -580,24 +580,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir dist
-          # Asset names drop the commit sha: the release tag already identifies the build, and
-          # stable names let the notes table link to them.
-          strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          for artifact in artifacts/*/; do
-            name=$(basename "$artifact")
-            if compgen -G "$artifact*.AppImage" > /dev/null; then
-              # Linux: ship the AppImage and the tar.gz as they are.
-              for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
-                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            elif compgen -G "$artifact*.zip" > /dev/null; then
-              for file in "$artifact"*.zip "$artifact"*.dmg; do
-                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
-            fi
-          done
+          # Wherever download-artifact put them (its own folder or straight in artifacts/).
+          find artifacts -type f \( -name '*.AppImage' -o -name '*.tar.gz' \) -print
+          found=0
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.AppImage) cp "$file" dist/Lichii-sharkiix-3.0-EXPERIMENTAL-linux-x86_64.AppImage ;;
+              *.tar.gz) cp "$file" dist/Lichii-sharkiix-3.0-EXPERIMENTAL-linux-x86_64.tar.gz ;;
+            esac
+            found=$((found + 1))
+          done < <(find artifacts -type f \( -name '*.AppImage' -o -name '*.tar.gz' \) -print0)
+          test "$found" -ge 2
           ls -la dist
 
       - name: Create draft release
