@@ -152,6 +152,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// The most device memory the collector lets the cache fill before it collects in earnest,
     /// on every GPU (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
+    u64 large_budget_cap{}; ///< Raises MaxCriticalMemory on cards with a 12 GiB+ budget
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
     using Runtime = typename P::Runtime;

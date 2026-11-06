@@ -260,7 +260,10 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // On every GPU: past what a frame needs, more device memory only keeps the textures of earlier
     // scenes (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget.
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
+    // Cards with a large budget (16 GB: ~15 GB) keep up to 3/4 of it: Ocarina's village alone
+    // keeps ~8 GB of textures, and under the 5 GiB cap the collector deleted and re-uploaded
+    // thousands of them every 20 s (~15% of the GPU back thread, 26-28 ms frames -> 23-24 ms).
+    critical_memory = (std::min)(critical_memory, (std::max)(MaxCriticalMemory, large_budget_cap));
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
@@ -332,6 +335,7 @@ void TextureCache<P>::TickFrame() {
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 if (budget > 2_GiB) {
+                    large_budget_cap = budget >= 12_GiB ? budget / 4 * 3 : 0;
                     const u64 old_critical = critical_memory;
                     const u64 margin = (std::min)(budget / 8, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
