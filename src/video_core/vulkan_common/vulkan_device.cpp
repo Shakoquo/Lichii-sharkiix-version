@@ -1318,6 +1318,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         SetNext(next, properties.descriptor_buffer);
     }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
     if (extensions.subgroup_size_control || features.subgroup_size_control.subgroupSizeControl) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
@@ -1451,6 +1456,28 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.depth_clip_control = features.depth_clip_control.depthClipControl;
     RemoveExtensionFeatureIfUnsuitable(extensions.depth_clip_control, features.depth_clip_control,
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library: on by default with AMD's own driver (the only one it was
+    // tested on), EDEN_NX2_GPL=1 turns it on elsewhere and EDEN_NX2_GPL=0 turns it off.
+    {
+        const char* gpl_env = std::getenv("EDEN_NX2_GPL");
+        const bool wanted = gpl_env != nullptr && gpl_env[0] != '\0'
+                                ? gpl_env[0] == '1'
+                                : properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+        extensions.graphics_pipeline_library =
+            wanted && extensions.pipeline_library &&
+            features.graphics_pipeline_library.graphicsPipelineLibrary;
+        RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                           features.graphics_pipeline_library,
+                                           VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "Graphics pipeline libraries: wanted={} supported={} enabled={}",
+                 wanted, features.graphics_pipeline_library.graphicsPipelineLibrary != 0,
+                 extensions.graphics_pipeline_library);
+        if (!extensions.graphics_pipeline_library && extensions.pipeline_library) {
+            RemoveExtensionIfUnsuitable(false, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            extensions.pipeline_library = false;
+        }
+    }
 
     // VK_EXT_descriptor_buffer
     extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;

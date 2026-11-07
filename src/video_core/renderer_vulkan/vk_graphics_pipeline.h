@@ -86,7 +86,8 @@ public:
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        const std::array<u64, NUM_STAGES>& spirv_hashes = {});
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -120,6 +121,8 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+    ~GraphicsPipeline();
+
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
@@ -202,6 +205,9 @@ private:
     u64 last_use_frame{};
 
     std::array<vk::ShaderModule, NUM_STAGES> spv_modules;
+    /// Hash of each stage's SPIR-V and of the descriptor layout, to share pipeline parts.
+    std::array<u64, NUM_STAGES> spirv_hashes{};
+    u64 layout_key{};
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<u32, 5> enabled_uniform_buffer_masks{};
@@ -219,6 +225,8 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    /// Optimized relink of a fast-linked pipeline, swapped in once built.
+    std::shared_ptr<struct PipelineOptimizeTask> optimize_task;
 
     DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;

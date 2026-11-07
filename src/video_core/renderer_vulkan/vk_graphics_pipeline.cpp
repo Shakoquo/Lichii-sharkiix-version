@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <span>
 
@@ -18,6 +19,8 @@
 
 #include "common/bit_field.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/pipeline_compile_trace.h"
+#include "video_core/renderer_vulkan/pipeline_library_cache.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
@@ -272,11 +275,13 @@ GraphicsPipeline::GraphicsPipeline(
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    const std::array<u64, NUM_STAGES>& spirv_hashes_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      spirv_hashes{spirv_hashes_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -325,6 +330,35 @@ GraphicsPipeline::GraphicsPipeline(
 
     const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
     pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    {
+        // Same inputs as the builder: pipelines with equal keys have identical layouts.
+        LibraryKeyHasher hasher{0x4c41594f5554ULL};
+        hasher.Add(uses_push_descriptor).Add(uses_descriptor_buffer);
+        const auto add_list = [&](const auto& descriptors) {
+            hasher.Add(static_cast<u32>(descriptors.size()));
+            for (const auto& desc : descriptors) {
+                hasher.Add(desc.count);
+            }
+        };
+        static constexpr std::array slots{
+            VK_SHADER_STAGE_VERTEX_BIT,
+            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+            VK_SHADER_STAGE_GEOMETRY_BIT,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            const Shader::Info& info = stage_infos[stage];
+            hasher.Add(StageFlag(info, slots[stage]));
+            add_list(info.constant_buffer_descriptors);
+            add_list(info.storage_buffers_descriptors);
+            add_list(info.texture_buffer_descriptors);
+            add_list(info.image_buffer_descriptors);
+            add_list(info.texture_descriptors);
+            add_list(info.image_descriptors);
+        }
+        layout_key = hasher.Get();
+    }
     if (!uses_descriptor_buffer) {
         descriptor_update_template =
             builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
@@ -377,6 +411,13 @@ GraphicsPipeline::GraphicsPipeline(
         worker_thread->QueueWork([this] { RunBuild(); });
     } else {
         RunBuild();
+    }
+}
+
+GraphicsPipeline::~GraphicsPipeline() {
+    if (optimize_task) {
+        std::scoped_lock lock{optimize_task->mutex};
+        optimize_task->cancelled = true;
     }
 }
 
@@ -743,10 +784,16 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            CompileTrace::WaitScope trace_wait{"graphics"};
             RunBuild();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
         });
+    }
+    if (is_built.load(std::memory_order_acquire) && optimize_task &&
+        !optimize_task->queued.exchange(true, std::memory_order_acq_rel)) {
+        // First draw with a fast-linked pipeline: relink it optimized in the background.
+        PipelineOptimizer::Instance().Queue(optimize_task->job);
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling, IsMeshPipeline())};
@@ -788,7 +835,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             if (!pipeline) {
                 return;
             }
-            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+            VkPipeline handle = *pipeline;
+            if (optimize_task && optimize_task->ready.load(std::memory_order_acquire)) {
+                handle = *optimize_task->optimized;
+            }
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
         }
         const VkShaderStageFlags push_stages =
             IsMeshPipeline() ? VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_TASK_BIT_EXT |
@@ -1233,7 +1284,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                                    MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
                 .module = *spv_modules[stage],
                 .pName = "main",
-                .pSpecializationInfo = nullptr,
+                .pSpecializationInfo = CompileTrace::Salt(),
             });
     }
     VkPipelineCreateFlags flags{};
@@ -1244,6 +1295,333 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
+    // Pipeline built from four shared parts (vertex input, vertex shaders, fragment shader,
+    // color output), each compiled once and reused, then linked quickly by the driver.
+    const bool use_libraries =
+        device.IsGraphicsPipelineLibraryUsable() &&
+        (flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) == 0 &&
+        (key.state.extended_dynamic_state_2 != 0 || rasterization_ci.rasterizerDiscardEnable == VK_FALSE);
+    bool linked = false;
+    if (use_libraries) {
+        // Test switches: EDEN_NX2_GPL_NOSHARE=1 gives every pipeline its own parts,
+        // EDEN_NX2_GPL_LTO=1 links with full optimization instead of a fast link.
+        static const bool no_share = [] {
+            const char* value = std::getenv("EDEN_NX2_GPL_NOSHARE");
+            return value != nullptr && value[0] == '1';
+        }();
+        static const bool full_link = [] {
+            const char* value = std::getenv("EDEN_NX2_GPL_LTO");
+            return value != nullptr && value[0] == '1';
+        }();
+        const auto common_hash = [&](u64 seed) {
+            LibraryKeyHasher hasher{seed};
+            if (no_share) {
+                hasher.Add(key.Hash()).Add(reinterpret_cast<u64>(this));
+            }
+            hasher.Add(full_link);
+            hasher.Add(flags).Add(static_cast<u32>(dynamic_states.size()));
+            for (const VkDynamicState state : dynamic_states) {
+                hasher.Add(state);
+            }
+            const VkSpecializationInfo* const salt = CompileTrace::Salt();
+            hasher.Add(salt != nullptr ? *static_cast<const u32*>(salt->pData) : 0u);
+            return hasher;
+        };
+        // A fast-linked part does not get the subgroup size the whole pipeline would: shaders
+        // with warp operations are pinned to the guest's 32 lanes (EDEN_NX2_GPL_WAVE=0 to test
+        // without).
+        static const bool pin_wave = [] {
+            const char* value = std::getenv("EDEN_NX2_GPL_WAVE");
+            return value == nullptr || value[0] != '0';
+        }();
+        const auto pin_subgroup = [&](size_t stage_index, VkPipelineShaderStageCreateInfo& stage_ci) {
+            const Shader::Info& info = stage_infos[stage_index];
+            const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                                       info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                                       info.uses_quad_shuffles || info.uses_fswzadd;
+            if (pin_wave && uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
+                device.IsGuestWarpSizeSupported(stage_ci.stage)) {
+                stage_ci.pNext = &subgroup_size_ci;
+            }
+        };
+        const auto add_stage = [&](LibraryKeyHasher& hasher, size_t stage_index,
+                                   const VkPipelineShaderStageCreateInfo& stage_ci) {
+            hasher.Add(stage_ci.stage).Add(stage_ci.flags).Add(spirv_hashes[stage_index])
+                .Add(stage_ci.pNext != nullptr);
+        };
+        const auto add_multisample = [&](LibraryKeyHasher& hasher) {
+            hasher.Add(multisample_ci.rasterizationSamples).Add(multisample_ci.sampleShadingEnable)
+                .Add(multisample_ci.minSampleShading).Add(multisample_ci.alphaToCoverageEnable)
+                .Add(multisample_ci.alphaToOneEnable);
+        };
+        static_vector<VkPipelineShaderStageCreateInfo, 5> pre_stages;
+        static_vector<VkPipelineShaderStageCreateInfo, 1> fragment_stages;
+        LibraryKeyHasher pre_hash = common_hash(0x5052455241535445ULL);
+        LibraryKeyHasher fragment_hash = common_hash(0x465241474d454e54ULL);
+        {
+            size_t index = 0;
+            for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
+                if (!spv_modules[stage]) {
+                    continue;
+                }
+                VkPipelineShaderStageCreateInfo stage_ci = shader_stages[index++];
+                pin_subgroup(stage, stage_ci);
+                if (stage_ci.stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+                    fragment_stages.push_back(stage_ci);
+                    add_stage(fragment_hash, stage, stage_ci);
+                } else {
+                    pre_stages.push_back(stage_ci);
+                    add_stage(pre_hash, stage, stage_ci);
+                }
+            }
+        }
+        const u64 render_pass_value = reinterpret_cast<u64>(render_pass);
+
+        LibraryKeyHasher input_hash = common_hash(0x564552544558494eULL);
+        input_hash.Add(static_cast<u32>(vertex_bindings.size()));
+        for (const auto& binding : vertex_bindings) {
+            input_hash.Add(binding.binding).Add(binding.stride).Add(binding.inputRate);
+        }
+        input_hash.Add(static_cast<u32>(vertex_binding_divisors.size()));
+        for (const auto& divisor : vertex_binding_divisors) {
+            input_hash.Add(divisor.binding).Add(divisor.divisor);
+        }
+        input_hash.Add(static_cast<u32>(vertex_attributes.size()));
+        for (const auto& attribute : vertex_attributes) {
+            input_hash.Add(attribute.location).Add(attribute.binding).Add(attribute.format)
+                .Add(attribute.offset);
+        }
+        input_hash.Add(input_assembly_ci.topology).Add(input_assembly_ci.primitiveRestartEnable);
+
+        // A state the pipeline sets as dynamic is ignored by the driver at build time, so it
+        // must not make two otherwise equal parts look different.
+        const auto is_dynamic = [&](VkDynamicState state) {
+            return std::ranges::find(dynamic_states, state) != dynamic_states.end();
+        };
+        const auto add_static = [&](LibraryKeyHasher& hasher, VkDynamicState state,
+                                    const auto& value) {
+            if (!is_dynamic(state)) {
+                hasher.Add(value);
+            }
+        };
+        pre_hash.Add(layout_key).Add(render_pass_value).Add(viewport_ci.viewportCount)
+            .Add(ndc_info.negativeOneToOne).Add(device.IsExtDepthClipControlSupported())
+            .Add(device.IsNvViewportSwizzleSupported()).Add(swizzles)
+            .Add(rasterization_ci.polygonMode)
+            .Add(IsLine(input_assembly_topology) && device.IsExtLineRasterizationSupported())
+            .Add(line_state.lineStippleFactor).Add(line_state.lineStipplePattern)
+            .Add(provoking_vertex.provokingVertexMode)
+            .Add(tessellation_ci.patchControlPoints).Add(has_tess_stages);
+        add_static(pre_hash, VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+                   rasterization_ci.depthClampEnable);
+        add_static(pre_hash, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE_EXT,
+                   rasterization_ci.rasterizerDiscardEnable);
+        add_static(pre_hash, VK_DYNAMIC_STATE_CULL_MODE_EXT, rasterization_ci.cullMode);
+        add_static(pre_hash, VK_DYNAMIC_STATE_FRONT_FACE_EXT, rasterization_ci.frontFace);
+        add_static(pre_hash, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE_EXT,
+                   rasterization_ci.depthBiasEnable);
+        add_static(pre_hash, VK_DYNAMIC_STATE_LINE_WIDTH, rasterization_ci.lineWidth);
+        add_static(pre_hash, VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT,
+                   line_state.lineRasterizationMode);
+        add_static(pre_hash, VK_DYNAMIC_STATE_LINE_STIPPLE_ENABLE_EXT,
+                   line_state.stippledLineEnable);
+        add_static(pre_hash, VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT,
+                   conservative_raster.conservativeRasterizationMode);
+
+        fragment_hash.Add(layout_key).Add(render_pass_value)
+            .Add(static_cast<u32>(fragment_stages.size()));
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT,
+                   depth_stencil_ci.depthTestEnable);
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT,
+                   depth_stencil_ci.depthWriteEnable);
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT,
+                   depth_stencil_ci.depthCompareOp);
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE_EXT,
+                   depth_stencil_ci.depthBoundsTestEnable);
+        add_static(fragment_hash, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT,
+                   depth_stencil_ci.stencilTestEnable);
+        if (!is_dynamic(VK_DYNAMIC_STATE_STENCIL_OP_EXT)) {
+            for (const VkStencilOpState* face : {&depth_stencil_ci.front, &depth_stencil_ci.back}) {
+                fragment_hash.Add(face->failOp).Add(face->passOp).Add(face->depthFailOp)
+                    .Add(face->compareOp);
+            }
+        }
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_BOUNDS, depth_stencil_ci.minDepthBounds);
+        add_static(fragment_hash, VK_DYNAMIC_STATE_DEPTH_BOUNDS, depth_stencil_ci.maxDepthBounds);
+        // The fragment shader and color output parts both carry the multisample state and the
+        // driver requires the two to be identical (AMD compiles alpha-to-coverage into the
+        // fragment shader's exports even when it is dynamic), so all of it is in both keys.
+        const auto add_multisample_static = [&](LibraryKeyHasher& hasher) {
+            add_multisample(hasher);
+        };
+        add_multisample_static(fragment_hash);
+
+        LibraryKeyHasher output_hash = common_hash(0x4f55545055544346ULL);
+        output_hash.Add(render_pass_value).Add(static_cast<u32>(cb_attachments.size()));
+        add_static(output_hash, VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT, color_blend_ci.logicOpEnable);
+        add_static(output_hash, VK_DYNAMIC_STATE_LOGIC_OP_EXT, color_blend_ci.logicOp);
+        for (const auto& attachment : cb_attachments) {
+            add_static(output_hash, VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, attachment.blendEnable);
+            if (!is_dynamic(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT)) {
+                output_hash.Add(attachment.srcColorBlendFactor).Add(attachment.dstColorBlendFactor)
+                    .Add(attachment.colorBlendOp).Add(attachment.srcAlphaBlendFactor)
+                    .Add(attachment.dstAlphaBlendFactor).Add(attachment.alphaBlendOp);
+            }
+            add_static(output_hash, VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+                       attachment.colorWriteMask);
+        }
+        add_multisample_static(output_hash);
+
+        const auto label = [&] {
+            return CompileTrace::Enabled()
+                       ? fmt::format("vs={:016x} fs={:016x}", key.unique_hashes[1],
+                                     key.unique_hashes[5])
+                       : std::string{};
+        };
+        const auto build_part = [&](VkGraphicsPipelineLibraryFlagsEXT part, const char* kind,
+                                    VkGraphicsPipelineCreateInfo ci) {
+            const VkGraphicsPipelineLibraryCreateInfoEXT library_ci{
+                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                .pNext = nullptr,
+                .flags = part,
+            };
+            ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            ci.pNext = &library_ci;
+            ci.flags = flags | VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+                       VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+            ci.pDynamicState = &dynamic_state_ci;
+            ci.basePipelineIndex = -1;
+            CompileTrace::CompileScope part_scope{kind, label()};
+            return device.GetLogical().CreateGraphicsPipeline(ci, *pipeline_cache);
+        };
+        auto& libraries = PipelineLibraryCache::Instance();
+        std::array<VkPipeline, 4> parts{};
+        // Mesh pipelines (task/mesh shaders) have no vertex input part.
+        parts[0] = is_mesh ? VK_NULL_HANDLE : libraries.GetOrBuild(input_hash.Get(), [&] {
+            VkGraphicsPipelineCreateInfo ci{};
+            ci.pVertexInputState = &vertex_input_ci;
+            ci.pInputAssemblyState = &input_assembly_ci;
+            return build_part(VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
+                              "gpl-input", ci);
+        });
+        auto fragment_part = std::async(std::launch::async, [&] {
+            return libraries.GetOrBuild(fragment_hash.Get(), [&] {
+            VkGraphicsPipelineCreateInfo ci{};
+            ci.stageCount = static_cast<u32>(fragment_stages.size());
+            ci.pStages = fragment_stages.data();
+            ci.pDepthStencilState = &depth_stencil_ci;
+            ci.pMultisampleState = &multisample_ci;
+            ci.layout = *pipeline_layout;
+            ci.renderPass = render_pass;
+            return build_part(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
+                              "gpl-fragment", ci);
+        });
+        });
+        parts[1] = libraries.GetOrBuild(pre_hash.Get(), [&] {
+            VkGraphicsPipelineCreateInfo ci{};
+            ci.stageCount = static_cast<u32>(pre_stages.size());
+            ci.pStages = pre_stages.data();
+            ci.pTessellationState = &tessellation_ci;
+            ci.pViewportState = &viewport_ci;
+            ci.pRasterizationState = &rasterization_ci;
+            ci.layout = *pipeline_layout;
+            ci.renderPass = render_pass;
+            return build_part(VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+                              "gpl-vertex", ci);
+        });
+        parts[2] = fragment_part.get();
+        parts[3] = libraries.GetOrBuild(output_hash.Get(), [&] {
+            VkGraphicsPipelineCreateInfo ci{};
+            ci.pColorBlendState = &color_blend_ci;
+            ci.pMultisampleState = &multisample_ci;
+            ci.renderPass = render_pass;
+            return build_part(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
+                              "gpl-output", ci);
+        });
+        std::array<VkPipeline, 4> link_parts{};
+        u32 num_parts = 0;
+        bool missing_part = false;
+        for (size_t index = 0; index < parts.size(); ++index) {
+            if (index == 0 && is_mesh) {
+                continue;
+            }
+            missing_part |= parts[index] == VK_NULL_HANDLE;
+            link_parts[num_parts++] = parts[index];
+        }
+        if (!missing_part) {
+            const VkPipelineLibraryCreateInfoKHR link_info{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                .pNext = nullptr,
+                .libraryCount = num_parts,
+                .pLibraries = link_parts.data(),
+            };
+            VkGraphicsPipelineCreateInfo link_ci{};
+            link_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            link_ci.pNext = &link_info;
+            link_ci.flags = flags | (full_link ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0);
+            link_ci.layout = *pipeline_layout;
+            link_ci.basePipelineIndex = -1;
+            try {
+                CompileTrace::CompileScope link_scope{"gpl-link", label()};
+                pipeline = device.GetLogical().CreateGraphicsPipeline(link_ci, *pipeline_cache);
+                linked = true;
+            } catch (const vk::Exception& exception) {
+                LOG_ERROR(Render_Vulkan, "Pipeline link failed, compiling it whole: {}",
+                          exception.what());
+            }
+            if (linked && !full_link && PipelineOptimizer::Enabled()) {
+                // The fast link skips cross-stage optimization, which AMD's fast-linked code
+                // gets visibly wrong on some effects: relink it optimized in the background.
+                auto task = std::make_shared<PipelineOptimizeTask>();
+                optimize_task = task;
+                task->job =
+                    [weak_task = std::weak_ptr<PipelineOptimizeTask>{task}, link_parts, num_parts, flags,
+                     layout = *pipeline_layout, &device = device, cache = *pipeline_cache,
+                     label = label()] {
+                        const std::shared_ptr<PipelineOptimizeTask> task = weak_task.lock();
+                        if (!task) {
+                            return;
+                        }
+                        std::scoped_lock lock{task->mutex};
+                        if (task->cancelled) {
+                            return;
+                        }
+                        const VkPipelineLibraryCreateInfoKHR optimize_libraries{
+                            .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+                            .pNext = nullptr,
+                            .libraryCount = num_parts,
+                            .pLibraries = link_parts.data(),
+                        };
+                        VkGraphicsPipelineCreateInfo optimize_ci{};
+                        optimize_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+                        optimize_ci.pNext = &optimize_libraries;
+                        optimize_ci.flags = flags | VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+                        optimize_ci.layout = layout;
+                        optimize_ci.basePipelineIndex = -1;
+                        try {
+                            CompileTrace::CompileScope optimize_scope{"gpl-optimize", label};
+                            task->optimized = device.GetLogical().CreateGraphicsPipeline(optimize_ci, cache);
+                            task->ready.store(true, std::memory_order_release);
+                        } catch (const vk::Exception& exception) {
+                            LOG_ERROR(Render_Vulkan, "Optimized pipeline relink failed: {}",
+                                      exception.what());
+                        }
+                    };
+            }
+            try {
+            } catch (const vk::Exception& exception) {
+                LOG_ERROR(Render_Vulkan, "Pipeline link failed, compiling it whole: {}",
+                          exception.what());
+            }
+        }
+    }
+
+    if (!linked) {
+    CompileTrace::CompileScope trace_scope{
+        "graphics", CompileTrace::Enabled()
+                        ? fmt::format("vs={:016x} fs={:016x}", key.unique_hashes[1],
+                                      key.unique_hashes[5])
+                        : std::string{}};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -1265,6 +1643,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

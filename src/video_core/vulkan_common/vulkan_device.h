@@ -63,6 +63,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
     FEATURE(EXT, DescriptorBuffer, DESCRIPTOR_BUFFER, descriptor_buffer)                           \
+    FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY,                               \
+            graphics_pipeline_library)                                                             \
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
@@ -101,6 +103,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(EXT, SHADER_VIEWPORT_INDEX_LAYER, shader_viewport_index_layer)                       \
     EXTENSION(EXT, TOOLING_INFO, tooling_info)                                                     \
     EXTENSION(EXT, VERTEX_ATTRIBUTE_DIVISOR, vertex_attribute_divisor)                             \
+    EXTENSION(KHR, PIPELINE_LIBRARY, pipeline_library)                                             \
     EXTENSION(KHR, CREATE_RENDERPASS_2, create_renderpass2)                                        \
     EXTENSION(KHR, DEPTH_STENCIL_RESOLVE, depth_stencil_resolve)                                   \
     EXTENSION(KHR, DRAW_INDIRECT_COUNT, draw_indirect_count)                                       \
@@ -557,6 +560,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports descriptor buffers.
     bool IsExtDescriptorBufferSupported() const {
         return extensions.descriptor_buffer;
+    }
+
+    /// Pipelines can be built from separately compiled, quickly linked parts (opt-in).
+    bool IsGraphicsPipelineLibraryUsable() const {
+        return extensions.graphics_pipeline_library && extensions.pipeline_library &&
+               properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
     }
 
     /// Returns the descriptor buffer properties of the device.
@@ -1302,6 +1311,7 @@ private:
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};

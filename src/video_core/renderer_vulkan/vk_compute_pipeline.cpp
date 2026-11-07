@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/pipeline_helper.h"
+#include "video_core/renderer_vulkan/pipeline_compile_trace.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -277,13 +278,16 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = *spv_module,
                 .pName = "main",
-                .pSpecializationInfo = nullptr,
+                .pSpecializationInfo = CompileTrace::Salt(),
             },
             .layout = *pipeline_layout,
             .basePipelineHandle = 0,
             .basePipelineIndex = 0,
         };
         try {
+            CompileTrace::CompileScope trace_scope{
+                "compute", CompileTrace::Enabled() ? fmt::format("cs={:016x}", shader_hash)
+                                                   : std::string{}};
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
@@ -584,6 +588,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (!is_built.load(std::memory_order::relaxed)) {
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
+            CompileTrace::WaitScope trace_wait{"compute"};
             RunBuild();
             std::unique_lock lock{build_mutex};
             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });

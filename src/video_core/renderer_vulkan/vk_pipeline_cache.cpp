@@ -34,6 +34,8 @@
 #include "video_core/memory_manager.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
+#include "video_core/renderer_vulkan/pipeline_compile_trace.h"
+#include "video_core/renderer_vulkan/pipeline_library_cache.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -325,6 +327,11 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+const char* StageTag(size_t index) {
+    static constexpr const char* tags[]{"vsa", "vs", "tcs", "tes", "gs", "fs"};
+    return index < 6 ? tags[index] : "xx";
+}
+
 size_t GetTotalPipelineWorkers() {
     const size_t logical_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
@@ -415,6 +422,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                            Common::ThreadPlacement::Background) {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
+    PipelineOptimizer::Instance().Start();
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
@@ -694,12 +702,14 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    PipelineOptimizer::Instance().Stop();
     StopBackgroundPipelines();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    PipelineLibraryCache::Instance().Clear();
 }
 
 void PipelineCache::SaveUsedPipelines() {
@@ -1329,6 +1339,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    std::array<u64, Maxwell::MaxShaderStage> spirv_hashes{};
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -1348,7 +1359,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
         const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, binding)};
+        CompileTrace::DumpSpirv(key.unique_hashes[index], StageTag(index), code);
         device.SaveShader(code);
+        spirv_hashes[stage_index] =
+            Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
         modules[stage_index] = BuildShader(device, code);
 
         // Text log + .spv dump. Text log is gated by gpu_log_level != Off; .spv dump
@@ -1379,7 +1393,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     return std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
-        render_pass_cache, key, std::move(modules), infos);
+        render_pass_cache, key, std::move(modules), infos, spirv_hashes);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -1549,6 +1563,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         program.shared_memory_size = max_shared_memory;
     }
     const std::vector<u32> code{EmitSPIRV(profile, program)};
+    CompileTrace::DumpSpirv(key.unique_hash, "cs", code);
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

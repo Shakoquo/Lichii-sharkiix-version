@@ -14,7 +14,7 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
+if (LICHII_BUILD_TAG MATCHES "^(build-[0-9]+|sharkiix-.+)$")
     set(BUILD_VERSION "${LICHII_BUILD_TAG}")
     set(IS_DEV_BUILD false)
 elseif (DEFINED GIT_RELEASE)

@@ -22,6 +22,16 @@ EDEN_NX2_FENCE_BATCH=1
 # Enable only if frame pacing stability is preferred over responsive controls.
 #EDEN_NX2_FRAMES_AHEAD=2
 
+# --- sharkiix 3.1: shader parts (VK_EXT_graphics_pipeline_library) ---
+# On by default with AMD's Windows driver: each shader is compiled in reusable parts and linked
+# almost instantly, so far fewer freezes; an optimized version replaces it in the background
+# after a few seconds. 0 turns it off; 1 turns it on with other drivers (untested there).
+#EDEN_NX2_GPL=0
+# 0 keeps the fast link only (no background optimized version; some effects then show dotted edges).
+#EDEN_NX2_GPL_OPTIMIZE=0
+# Shader timing log for bug reports (written to the emulator log).
+#EDEN_NX2_COMPILE_TRACE=1
+
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
