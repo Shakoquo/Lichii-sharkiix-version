@@ -1288,6 +1288,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             });
     }
     VkPipelineCreateFlags flags{};
+    const bool avoid_optimizer = NeedsOcarinaOptimizerWorkaround(device, key.unique_hashes[5]);
+    if (avoid_optimizer) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
     if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     }
@@ -1298,7 +1302,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     // Pipeline built from four shared parts (vertex input, vertex shaders, fragment shader,
     // color output), each compiled once and reused, then linked quickly by the driver.
     const bool use_libraries =
-        device.IsGraphicsPipelineLibraryUsable() &&
+        !avoid_optimizer && device.IsGraphicsPipelineLibraryUsable() &&
         !PipelineLibrariesFailed().load(std::memory_order_acquire) &&
         (flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) == 0 &&
         (key.state.extended_dynamic_state_2 != 0 || rasterization_ci.rasterizerDiscardEnable == VK_FALSE);

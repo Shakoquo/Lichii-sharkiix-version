@@ -24,6 +24,24 @@ namespace Vulkan {
 
 using Shader::Backend::SPIRV::NUM_TEXTURE_AND_IMAGE_SCALING_WORDS;
 
+// AMD Vulkan 2.0.353 can fault in the optimizer for two Ocarina fragment shaders
+// and spend several minutes optimizing either of the two compute shaders.
+inline bool NeedsOcarinaOptimizerWorkaround(const Device& device, u64 shader_hash) {
+    if (device.GetDriverID() != VK_DRIVER_ID_AMD_PROPRIETARY ||
+        device.GetDriverVersion() != VK_MAKE_API_VERSION(0, 2, 0, 353)) {
+        return false;
+    }
+    switch (shader_hash) {
+    case 0x3c2193d0166610b3ULL: // Fragment
+    case 0xbb5c27d79d59c88fULL: // Fragment
+    case 0xeff3ccbe1438679dULL: // Compute
+    case 0xf9ea14a22394f5b1ULL: // Compute
+        return true;
+    default:
+        return false;
+    }
+}
+
 [[nodiscard]] inline std::optional<PixelFormat> PixelFormatFromImageFormat(
     Shader::ImageFormat format) {
     switch (format) {
