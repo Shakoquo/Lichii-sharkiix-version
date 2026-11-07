@@ -1457,21 +1457,26 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.depth_clip_control, features.depth_clip_control,
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
 
-    // VK_EXT_graphics_pipeline_library: on by default with AMD's own driver (the only one it was
-    // tested on), EDEN_NX2_GPL=1 turns it on elsewhere and EDEN_NX2_GPL=0 turns it off.
+    // VK_EXT_graphics_pipeline_library: on by default with AMD's own driver on RX 7000 / RX 9000
+    // cards (RDNA 3 and newer, PCI ids 0x7400-0x7fff), where it was tested. RX 6600 / 6650 XT
+    // (driver 2.0.353) crashed seconds after boot once the optimized relinks failed, so older
+    // cards keep whole pipelines. EDEN_NX2_GPL=1 turns it on anywhere, EDEN_NX2_GPL=0 turns it off.
     {
         const char* gpl_env = std::getenv("EDEN_NX2_GPL");
-        const bool wanted = gpl_env != nullptr && gpl_env[0] != '\0'
-                                ? gpl_env[0] == '1'
-                                : properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
+        const u32 pci_id = properties.properties.deviceID;
+        const bool tested_card = properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY &&
+                                 pci_id >= 0x7400 && pci_id < 0x8000;
+        const bool wanted = gpl_env != nullptr && gpl_env[0] != '\0' ? gpl_env[0] == '1'
+                                                                      : tested_card;
         extensions.graphics_pipeline_library =
             wanted && extensions.pipeline_library &&
             features.graphics_pipeline_library.graphicsPipelineLibrary;
         RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
                                            features.graphics_pipeline_library,
                                            VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
-        LOG_INFO(Render_Vulkan, "Graphics pipeline libraries: wanted={} supported={} enabled={}",
-                 wanted, features.graphics_pipeline_library.graphicsPipelineLibrary != 0,
+        LOG_INFO(Render_Vulkan,
+                 "Graphics pipeline libraries: device {:04x}, wanted={} supported={} enabled={}",
+                 pci_id, wanted,features.graphics_pipeline_library.graphicsPipelineLibrary != 0,
                  extensions.graphics_pipeline_library);
         if (!extensions.graphics_pipeline_library && extensions.pipeline_library) {
             RemoveExtensionIfUnsuitable(false, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);

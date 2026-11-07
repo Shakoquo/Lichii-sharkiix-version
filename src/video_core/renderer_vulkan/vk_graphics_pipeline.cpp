@@ -1299,6 +1299,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     // color output), each compiled once and reused, then linked quickly by the driver.
     const bool use_libraries =
         device.IsGraphicsPipelineLibraryUsable() &&
+        !PipelineLibrariesFailed().load(std::memory_order_acquire) &&
         (flags & VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR) == 0 &&
         (key.state.extended_dynamic_state_2 != 0 || rasterization_ci.rasterizerDiscardEnable == VK_FALSE);
     bool linked = false;
@@ -1568,6 +1569,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             } catch (const vk::Exception& exception) {
                 LOG_ERROR(Render_Vulkan, "Pipeline link failed, compiling it whole: {}",
                           exception.what());
+                ReportPipelineLibraryFailure();
             }
             if (linked && !full_link && PipelineOptimizer::Enabled()) {
                 // The fast link skips cross-stage optimization, which AMD's fast-linked code
@@ -1583,7 +1585,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                             return;
                         }
                         std::scoped_lock lock{task->mutex};
-                        if (task->cancelled) {
+                        if (task->cancelled ||
+                            PipelineLibrariesFailed().load(std::memory_order_acquire)) {
                             return;
                         }
                         const VkPipelineLibraryCreateInfoKHR optimize_libraries{
@@ -1605,13 +1608,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                         } catch (const vk::Exception& exception) {
                             LOG_ERROR(Render_Vulkan, "Optimized pipeline relink failed: {}",
                                       exception.what());
+                            ReportPipelineLibraryFailure();
                         }
                     };
-            }
-            try {
-            } catch (const vk::Exception& exception) {
-                LOG_ERROR(Render_Vulkan, "Pipeline link failed, compiling it whole: {}",
-                          exception.what());
             }
         }
     }

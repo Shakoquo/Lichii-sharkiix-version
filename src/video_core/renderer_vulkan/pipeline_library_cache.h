@@ -48,6 +48,20 @@ private:
     u64 hash;
 };
 
+/// Set once the driver failed to build, link or relink a pipeline part: an older AMD driver on an
+/// RX 6000 card crashed seconds after such failures, so from then on pipelines are built whole.
+inline std::atomic<bool>& PipelineLibrariesFailed() {
+    static std::atomic<bool> failed{false};
+    return failed;
+}
+
+inline void ReportPipelineLibraryFailure() {
+    if (!PipelineLibrariesFailed().exchange(true, std::memory_order_acq_rel)) {
+        LOG_ERROR(Render_Vulkan,
+                  "Pipeline parts failed in the driver: building whole pipelines from now on");
+    }
+}
+
 class PipelineLibraryCache {
 public:
     static PipelineLibraryCache& Instance() {
@@ -77,6 +91,7 @@ public:
                 library = build();
             } catch (const vk::Exception& exception) {
                 LOG_ERROR(Render_Vulkan, "Pipeline library build failed: {}", exception.what());
+                ReportPipelineLibraryFailure();
             }
             std::scoped_lock lock{entry->mutex};
             entry->library = std::move(library);
