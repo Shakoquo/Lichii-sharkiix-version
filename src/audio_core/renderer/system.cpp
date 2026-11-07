@@ -32,6 +32,7 @@
 #include "audio_core/renderer/voice/voice_info.h"
 #include "audio_core/renderer/voice/voice_state.h"
 #include "common/alignment.h"
+#include "common/nx2_movie_clock.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -453,6 +454,9 @@ void System::Stop() {
 
 Result System::Update(std::span<const u8> input, std::span<u8> performance, std::span<u8> output) {
     std::scoped_lock l{lock};
+    if (Common::Nx2MovieClock::Enabled()) {
+        Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().renderer_updates, 1);
+    }
 
     const auto start_time{core.CoreTiming().GetGlobalTimeNs().count()};
     std::memset(output.data(), 0, output.size());
@@ -743,6 +747,11 @@ u64 System::GenerateCommand(std::span<u8> in_command_buffer,
     num_command_lists_generated++;
     render_start_tick = audio_renderer.GetRenderingStartTick(session_id);
     frames_elapsed++;
+    if (Common::Nx2MovieClock::Enabled()) {
+        auto& clock = Common::Nx2MovieClock::Get();
+        Common::Nx2MovieClock::Add(clock.renderer_passes, 1);
+        Common::Nx2MovieClock::Add(clock.voices_dropped, static_cast<u64>(num_voices_dropped));
+    }
 
     return command_buffer.size;
 }

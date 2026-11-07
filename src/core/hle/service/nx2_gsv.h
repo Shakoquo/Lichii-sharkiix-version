@@ -29,6 +29,7 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
+#include "common/nx2_movie_clock.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -1851,10 +1852,55 @@ private:
                 m_stats = {.last_present = entered};
             }
         }
+        if (Common::Nx2MovieClock::Enabled()) {
+            LogMovieClock(paced);
+        }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
         system.GPU().WakePendingChannels();
+    }
+
+    struct MovieClockState {
+        std::chrono::steady_clock::time_point wall{};
+        s64 guest_ns{};
+        u64 presents{};
+        std::array<u64, 12> counts{};
+    };
+    MovieClockState m_movie_clock{};
+
+    void LogMovieClock(std::chrono::steady_clock::time_point now) {
+        auto& c = Common::Nx2MovieClock::Get();
+        const auto load = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
+        const std::array<u64, 12> counts{
+            load(c.video_takes),    load(c.video_releases),   load(c.take_to_release_us),
+            load(c.renderer_updates), load(c.renderer_passes), load(c.voices_dropped),
+            load(c.voice_samples),  load(c.sink_frames[0]),    load(c.sink_padded[0]),
+            load(c.sink_frames[1]), load(c.sink_padded[1]),    0};
+        const s64 guest_ns = system.CoreTiming().GetGlobalTimeNs().count();
+        auto& last = m_movie_clock;
+        ++last.presents;
+        if (last.wall == std::chrono::steady_clock::time_point{}) {
+            last = {now, guest_ns, 0, counts};
+            return;
+        }
+        if (now - last.wall < std::chrono::seconds{1}) {
+            return;
+        }
+        std::array<u64, 12> d{};
+        for (size_t i = 0; i < d.size(); ++i) {
+            d[i] = counts[i] - last.counts[i];
+        }
+        const double wall_ms = std::chrono::duration<double, std::milli>(now - last.wall).count();
+        LOG_INFO(Service,
+                 "Nx2 movie clock: wall {:.1f} ms, guest {:.1f} ms | presents {} | video takes {} "
+                 "releases {} take->release {:.1f} ms, pts {:.3f} s | audio updates {} passes {} "
+                 "dropped {} voice samples {} | sink0 {} ({} padded) sink1 {} ({} padded)",
+                 wall_ms, static_cast<double>(guest_ns - last.guest_ns) / 1e6, last.presents,
+                 d[0], d[1], d[1] ? static_cast<double>(d[2]) / static_cast<double>(d[1]) / 1000.0 : 0.0,
+                 static_cast<double>(load(c.video_last_pts_us)) / 1e6, d[3], d[4], d[5], d[6], d[7],
+                 d[8], d[9], d[10]);
+        last = {now, guest_ns, 0, counts};
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -2598,6 +2644,37 @@ private:
         u32 value;
     };
 
+    // Ocarina shows one movie frame per game frame: skip late ones on a real clock (m_mutex held).
+    static constexpr u64 OcarinaOfTimeMovieProgramId = 0x0400486024DEC000ULL;
+    static constexpr auto MovieClockPause = std::chrono::seconds{1};
+
+    bool SyncsToClock() {
+        return system.GetApplicationProcessProgramID() == OcarinaOfTimeMovieProgramId;
+    }
+
+    bool IsLate(u64 pts) const {
+        if (!m_clock_running) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_clock_last_take > MovieClockPause) {
+            return false;
+        }
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - m_clock_start).count();
+        const u64 due = m_clock_start_pts + static_cast<u64>((std::max<s64>)(elapsed, 0));
+        return pts + 2 * m_frame_us < due;
+    }
+
+    void EndMovieClock() {
+        if (m_late_dropped != 0) {
+            LOG_INFO(Service, "{} skipped {} late frames to keep the movie in time",
+                     GetServiceName(), m_late_dropped);
+        }
+        m_late_dropped = 0;
+        m_clock_running = false;
+    }
+
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
@@ -2683,6 +2760,8 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
+            m_frame_us = w[7] != 0 && w[7] <= 240 ? u64{1'000'000} / w[7] : u64{1'000'000} / 60;
+            m_clock_running = false;
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2775,6 +2854,17 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
+        if (const auto taken = m_take_times.find(w[2]);
+            Common::Nx2MovieClock::Enabled() && taken != m_take_times.end()) {
+            auto& clock = Common::Nx2MovieClock::Get();
+            Common::Nx2MovieClock::Add(clock.video_releases, 1);
+            Common::Nx2MovieClock::Add(
+                clock.take_to_release_us,
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - taken->second)
+                                     .count()));
+            m_take_times.erase(taken);
+        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -2868,6 +2958,7 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
+            EndMovieClock();
         }
         TipcReplyWords(ctx, {});
     }
@@ -2898,6 +2989,11 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                const auto now = std::chrono::steady_clock::now();
+                if (m_clock_running && now - m_clock_last_take > MovieClockPause) {
+                    m_clock_start += now - m_clock_last_take;
+                }
+                m_clock_last_take = now;
             }
         }
         if (!output) {
@@ -2909,6 +3005,12 @@ private:
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
+        }
+        if (Common::Nx2MovieClock::Enabled()) {
+            auto& clock = Common::Nx2MovieClock::Get();
+            Common::Nx2MovieClock::Add(clock.video_takes, 1);
+            clock.video_last_pts_us.store(output->pts, std::memory_order_relaxed);
+            m_take_times[output->image] = std::chrono::steady_clock::now();
         }
         const u64 pts_ns = output->pts * 1000;
         if (Nx2VideoTraceEnabled()) {
@@ -2941,6 +3043,7 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
+                EndMovieClock();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -2949,8 +3052,19 @@ private:
                 continue;
             }
             if (!m_decoded.empty() && !m_free.empty()) {
+                while (m_decoded.size() > 1 && !m_decoded.front().end &&
+                       IsLate(m_decoded.front().pts)) {
+                    m_decoded.pop_front();
+                    ++m_late_dropped;
+                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
+                if (!m_clock_running && frame.picture && !frame.end && SyncsToClock()) {
+                    m_clock_running = true;
+                    m_clock_start = std::chrono::steady_clock::now();
+                    m_clock_last_take = m_clock_start;
+                    m_clock_start_pts = frame.pts;
+                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -2970,6 +3084,7 @@ private:
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
+                    EndMovieClock();
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
@@ -3025,9 +3140,22 @@ private:
             if (m_flush) {
                 continue;
             }
-            for (auto& picture : pictures) {
-                const u64 pts = picture.pts;
-                m_decoded.push_back({std::move(picture), pts, false});
+            for (size_t i = 0; i < pictures.size(); ++i) {
+                const u64 pts = pictures[i].pts;
+                if (IsLate(pts)) {
+                    const bool last = input.end && i + 1 == pictures.size();
+                    const bool newer_follows = i + 1 < pictures.size() || !m_inputs.Empty();
+                    if (!last && newer_follows) {
+                        ++m_late_dropped;
+                        continue;
+                    }
+                    while (!m_decoded.empty() && !m_decoded.back().end &&
+                           IsLate(m_decoded.back().pts)) {
+                        m_decoded.pop_back();
+                        ++m_late_dropped;
+                    }
+                }
+                m_decoded.push_back({std::move(pictures[i]), pts, false});
             }
             if (input.end) {
                 // The client stops at the frame marked end of stream; give it one even when the
@@ -3226,6 +3354,13 @@ private:
     bool m_end_queued{};
     bool m_flush{};
     bool m_quit{};
+    std::map<u32, std::chrono::steady_clock::time_point> m_take_times;
+    u64 m_frame_us{1'000'000 / 60};
+    bool m_clock_running{};
+    std::chrono::steady_clock::time_point m_clock_start{};
+    std::chrono::steady_clock::time_point m_clock_last_take{};
+    u64 m_clock_start_pts{};
+    u64 m_late_dropped{};
     std::thread m_worker;
 };
 
